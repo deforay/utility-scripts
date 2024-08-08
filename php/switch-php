@@ -1,7 +1,6 @@
 #!/bin/bash
 
 # To use this script:
-# cd ~;
 # sudo wget https://raw.githubusercontent.com/deforay/utility-scripts/master/php/switch-php -O /usr/local/bin/switch-php
 # sudo chmod +x /usr/local/bin/switch-php
 # sudo switch-php 7.4
