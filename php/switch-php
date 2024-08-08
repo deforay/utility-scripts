@@ -1,0 +1,102 @@
+#!/bin/bash
+
+# To use this script:
+# sudo switch-php 7.4;
+# sudo switch-php 8.2;
+
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+    echo "Please run as root."
+    exit 1
+fi
+
+# Check if the user provided a PHP version
+if [ -z "$1" ]; then
+    echo "Please provide a PHP version (e.g., 7.4, 8.0, 8.1, 8.2)"
+    exit 1
+fi
+
+PHP_VERSION=$1
+
+# Update and install necessary packages
+apt update && apt upgrade -y && apt autoremove -y
+
+apt install -y build-essential software-properties-common gnupg apt-transport-https ca-certificates lsb-release wget vim zip unzip curl acl snapd rsync git gdebi net-tools sed mawk magic-wormhole openssh-server libsodium-dev
+
+# Check if SSH service is enabled and running
+systemctl enable ssh
+systemctl start ssh
+
+# Add Ondřej Surý's PPA if it's not already added
+if ! grep -q "ondrej/php" /etc/apt/sources.list /etc/apt/sources.list.d/*; then
+    add-apt-repository ppa:ondrej/php -y
+    apt-get update -y
+fi
+
+# Check if the PHP version is already installed
+if ! command -v php$PHP_VERSION >/dev/null 2>&1; then
+    echo "PHP $PHP_VERSION is not installed. Installing now..."
+
+    # Install the requested PHP version and its core components
+    apt-get install -y "php$PHP_VERSION" "libapache2-mod-php$PHP_VERSION"
+
+    # Define the list of extensions to be installed
+    extensions=(
+        "openssl"
+        "common"
+        "cli"
+        "json"
+        "mysql"
+        "pdo_mysql"
+        "zip"
+        "gd"
+        "mbstring"
+        "curl"
+        "xml"
+        "xmlrpc"
+        "bcmath"
+        "gmp"
+        "intl"
+        "imagick"
+        "apcu"
+        "opcache"
+        "fileinfo"
+        "memcache"
+        "memcached"
+        "redis"
+    )
+
+    # Install all the required extensions
+    apt-get install -y "${extensions[@]/#/php$PHP_VERSION-}"
+
+    apt-get install php-mime-type -y
+
+else
+    echo "PHP $PHP_VERSION is already installed."
+fi
+
+# Disable all PHP versions
+a2dismod $(ls /etc/apache2/mods-enabled | grep -oP '^php\d\.\d') -f
+
+# Enable the requested PHP version
+a2enmod "php$PHP_VERSION"
+
+# Update the alternatives system to point to the desired PHP version for the CLI
+update-alternatives --set php "/usr/bin/php$PHP_VERSION"
+update-alternatives --set phar "/usr/bin/phar$PHP_VERSION"
+update-alternatives --set phar.phar "/usr/bin/phar.phar$PHP_VERSION"
+
+# Add APC for CLI - ensure it's added only once
+CLI_PHP_INI="/etc/php/$PHP_VERSION/cli/php.ini"
+if ! grep -q "apc.enable_cli=1" "$CLI_PHP_INI"; then
+    echo "apc.enable_cli=1" | tee -a "$CLI_PHP_INI"
+fi
+
+# Restart Apache to apply changes
+service apache2 restart || {
+    echo "Failed to restart Apache. Please check the configuration."
+    exit 1
+}
+
+echo "Switched to PHP $PHP_VERSION"
+echo "PHP CLI version switched"
