@@ -58,41 +58,50 @@ if ! command -v php$PHP_VERSION >/dev/null 2>&1; then
 
     # Install the requested PHP version and its core components
     apt-get install -y "php$PHP_VERSION" "libapache2-mod-php$PHP_VERSION"
-
-    # Define the list of extensions to be installed
-    extensions=(
-        "openssl"
-        "common"
-        "cli"
-        "json"
-        "mysql"
-        "pdo_mysql"
-        "zip"
-        "gd"
-        "mbstring"
-        "curl"
-        "xml"
-        "xmlrpc"
-        "bcmath"
-        "gmp"
-        "intl"
-        "imagick"
-        "apcu"
-        "opcache"
-        "fileinfo"
-        "memcache"
-        "memcached"
-        "redis"
-    )
-
-    # Install all the required extensions
-    apt-get install -y "${extensions[@]/#/php$PHP_VERSION-}"
-
-    apt-get install php-mime-type -y
-
 else
     echo "PHP $PHP_VERSION is already installed."
 fi
+
+# Define the list of extensions to be installed
+extensions=(
+    "openssl"
+    "common"
+    "cli"
+    "json"
+    "mysql"
+    "pdo_mysql"
+    "zip"
+    "gd"
+    "mbstring"
+    "curl"
+    "xml"
+    "xmlrpc"
+    "bcmath"
+    "gmp"
+    "intl"
+    "imagick"
+    "apcu"
+    "opcache"
+    "fileinfo"
+    "memcache"
+    "memcached"
+    "redis"
+)
+
+# Install required extensions if they are not already installed
+for extension in "${extensions[@]}"; do
+    if ! dpkg -l | grep -q "php$PHP_VERSION-$extension"; then
+        echo "Installing php$PHP_VERSION-$extension..."
+        apt-get install -y "php$PHP_VERSION-$extension" || {
+            echo "Failed to install php$PHP_VERSION-$extension. Exiting."
+            exit 1
+        }
+    else
+        echo "php$PHP_VERSION-$extension is already installed."
+    fi
+done
+
+apt-get install php-mime-type -y
 
 # Disable all PHP versions
 a2dismod $(ls /etc/apache2/mods-enabled | grep -oP '^php\d\.\d') -f

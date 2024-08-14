@@ -1,10 +1,11 @@
 #!/bin/bash
 
 # To use this script:
+# sudo -s
 # cd /tmp
-# sudo wget https://raw.githubusercontent.com/deforay/utility-scripts/master/lamp/lamp-setup.sh -O /usr/local/bin/switch-php
-# sudo chmod +x ./lamp-setup.sh
-# sudo ./lamp-setup.sh
+# wget https://raw.githubusercontent.com/deforay/utility-scripts/master/lamp/lamp-setup.sh
+# chmod +x ./lamp-setup.sh
+# ./lamp-setup.sh
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then
