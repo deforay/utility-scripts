@@ -64,7 +64,6 @@ fi
 
 # Define the list of extensions to be installed
 extensions=(
-    "openssl"
     "common"
     "cli"
     "json"
@@ -92,10 +91,16 @@ extensions=(
 for extension in "${extensions[@]}"; do
     if ! dpkg -l | grep -q "php$PHP_VERSION-$extension"; then
         echo "Installing php$PHP_VERSION-$extension..."
-        apt-get install -y "php$PHP_VERSION-$extension" || {
-            echo "Failed to install php$PHP_VERSION-$extension. Exiting."
-            exit 1
-        }
+        # Check if the package is available before trying to install it
+        if apt-cache search "php$PHP_VERSION-$extension" | grep -q "php$PHP_VERSION-$extension"; then
+            apt-get install -y "php$PHP_VERSION-$extension" || {
+                echo "Failed to install php$PHP_VERSION-$extension. Logging error and continuing."
+                echo "Failed to install php$PHP_VERSION-$extension" >>/var/log/php-switch-error.log
+            }
+        else
+            echo "Package php$PHP_VERSION-$extension not found in the repository. Skipping."
+            echo "Package php$PHP_VERSION-$extension not found" >>/var/log/php-switch-error.log
+        fi
     else
         echo "php$PHP_VERSION-$extension is already installed."
     fi
