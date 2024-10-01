@@ -40,6 +40,8 @@ PHP_VERSION=$1
 # Update and install necessary packages
 apt update && apt upgrade -y && apt autoremove -y
 
+dpkg --configure -a
+
 apt install -y build-essential software-properties-common gnupg apt-transport-https ca-certificates lsb-release wget vim zip unzip curl acl snapd rsync git gdebi net-tools sed mawk magic-wormhole openssh-server libsodium-dev
 
 # Check if SSH service is enabled and running

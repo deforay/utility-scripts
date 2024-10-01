@@ -96,7 +96,7 @@ if ! grep -q "ondrej/apache2" /etc/apt/sources.list /etc/apt/sources.list.d/*; t
 fi
 
 echo "Installing basic packages..."
-apt-get install -y build-essential software-properties-common gnupg apt-transport-https ca-certificates lsb-release wget vim zip unzip curl acl snapd rsync git gdebi net-tools sed mawk magic-wormhole openssh-server libsodium-dev
+apt-get install -y build-essential software-properties-common gnupg apt-transport-https ca-certificates lsb-release wget vim zip unzip curl acl snapd rsync git gdebi net-tools sed mawk magic-wormhole openssh-server libsodium-dev mosh
 
 echo "Setting up locale..."
 locale-gen en_US en_US.UTF-8
