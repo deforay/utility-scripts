@@ -83,7 +83,6 @@ extensions=(
     "imagick"
     "apcu"
     "opcache"
-    "fileinfo"
     "memcache"
     "memcached"
     "redis"
