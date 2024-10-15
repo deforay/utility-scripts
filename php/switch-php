@@ -44,10 +44,6 @@ dpkg --configure -a
 
 apt install -y build-essential software-properties-common gnupg apt-transport-https ca-certificates lsb-release wget vim zip unzip curl acl snapd rsync git gdebi net-tools sed mawk magic-wormhole openssh-server libsodium-dev
 
-# Check if SSH service is enabled and running
-systemctl enable ssh
-systemctl start ssh
-
 # Add Ondřej Surý's PPA if it's not already added
 if ! grep -q "ondrej/php" /etc/apt/sources.list /etc/apt/sources.list.d/*; then
     add-apt-repository ppa:ondrej/php -y
@@ -107,20 +103,16 @@ for extension in "${extensions[@]}"; do
     fi
 done
 
-# Disable all PHP versions explicitly
-# Get a list of enabled PHP versions
-enabled_php_modules=$(ls /etc/apache2/mods-enabled | grep -oP '^php\d\.\d')
+# Disable the currently enabled PHP version
+enabled_php_version=$(ls /etc/apache2/mods-enabled | grep -oP '^php\d\.\d')
 
-# Disable each PHP version if any are found
-if [ -n "$enabled_php_modules" ]; then
-    for version in $enabled_php_modules; do
-        a2dismod $version -f
-    done
-else
-    echo "No PHP modules to disable."
+if [ -n "$enabled_php_version" ]; then
+    echo "Disabling PHP $enabled_php_version"
+    a2dismod $enabled_php_version
 fi
 
 # Enable the requested PHP version
+echo "Enabling PHP $PHP_VERSION"
 a2enmod "php$PHP_VERSION"
 
 # Update the alternatives system to point to the desired PHP version for the CLI
