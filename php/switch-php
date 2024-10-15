@@ -108,9 +108,17 @@ for extension in "${extensions[@]}"; do
 done
 
 # Disable all PHP versions explicitly
-for version in $(ls /etc/apache2/mods-enabled | grep -oP '^php\d\.\d'); do
-    a2dismod $version
-done
+# Get a list of enabled PHP versions
+enabled_php_modules=$(ls /etc/apache2/mods-enabled | grep -oP '^php\d\.\d')
+
+# Disable each PHP version if any are found
+if [ -n "$enabled_php_modules" ]; then
+    for version in $enabled_php_modules; do
+        a2dismod $version -f
+    done
+else
+    echo "No PHP modules to disable."
+fi
 
 # Enable the requested PHP version
 a2enmod "php$PHP_VERSION"
