@@ -103,12 +103,14 @@ for extension in "${extensions[@]}"; do
     fi
 done
 
-# Disable the currently enabled PHP version
+# Disable the currently enabled PHP version if it's not the target version
 enabled_php_version=$(ls /etc/apache2/mods-enabled | grep -oP '^php\d\.\d')
 
-if [ -n "$enabled_php_version" ]; then
+if [ -n "$enabled_php_version" ] && [ "$enabled_php_version" != "php$PHP_VERSION" ]; then
     echo "Disabling PHP $enabled_php_version"
     a2dismod $enabled_php_version
+else
+    echo "PHP $enabled_php_version is already the target version."
 fi
 
 # Enable the requested PHP version
