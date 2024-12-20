@@ -5,7 +5,7 @@
 # cd /tmp
 # wget https://raw.githubusercontent.com/deforay/utility-scripts/master/lamp/lamp-setup.sh
 # chmod +x ./lamp-setup.sh
-# ./lamp-setup.sh
+# ./lamp-setup.sh [PHP_VERSION]
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then
@@ -13,8 +13,6 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Error trap
-trap 'echo "An error occurred. Exiting..."; exit 1' ERR
 
 ask_yes_no() {
     local timeout=15
@@ -62,8 +60,35 @@ spinner() {
     printf "    \b\b\b\b"
 }
 
+# Function to log messages
+log_action() {
+    local message=$1
+    echo "$(date +'%Y-%m-%d %H:%M:%S') - $message" >>~/logsetup.log
+}
+
+
+error_handling() {
+    local last_cmd=$1
+    local last_line=$2
+    local last_error=$3
+    echo "Error on or near line ${last_line}; command executed was '${last_cmd}' which exited with status ${last_error}"
+    log_action "Error on or near line ${last_line}; command executed was '${last_cmd}' which exited with status ${last_error}"
+
+    # Check if the error is critical
+    if [ "$last_error" -eq 1 ]; then # Adjust according to the error codes you consider critical
+        echo "This error is critical, exiting..."
+        exit 1
+    else
+        echo "This error is not critical, continuing..."
+    fi
+}
+
+
+# Error trap
+trap 'error_handling "${BASH_COMMAND}" "$LINENO" "$?"' ERR
+
 # Check if Ubuntu version is 20.04 or newer
-min_version="20.04"
+min_version="22.04"
 current_version=$(lsb_release -rs)
 
 if [[ "$(printf '%s\n' "$min_version" "$current_version" | sort -V | head -n1)" != "$min_version" ]]; then
@@ -72,7 +97,7 @@ if [[ "$(printf '%s\n' "$min_version" "$current_version" | sort -V | head -n1)" 
 fi
 
 # Check for dependencies
-for cmd in "apt"; do
+for cmd in "apt-get"; do
     if ! command -v $cmd &>/dev/null; then
         echo "$cmd is not installed. Exiting..."
         exit 1
@@ -104,6 +129,24 @@ export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 update-locale
 
+
+# Check if SSH service is enabled
+if ! systemctl is-enabled ssh >/dev/null 2>&1; then
+    echo "Enabling SSH service..."
+    systemctl enable ssh
+else
+    echo "SSH service is already enabled."
+fi
+
+# Check if SSH service is running
+if ! systemctl is-active ssh >/dev/null 2>&1; then
+    echo "Starting SSH service..."
+    systemctl start ssh
+else
+    echo "SSH service is already running."
+fi
+
+
 # Apache Setup
 if command -v apache2 &>/dev/null; then
     echo "Apache is already installed. Skipping installation..."
@@ -117,8 +160,33 @@ else
         echo "Failed to restart Apache2. Exiting..."
         exit 1
     }
-    setfacl -R -m u:$USER:rwx,u:www-data:rwx /var/www
 fi
+
+
+# Check for Brotli support and install it if necessary
+if ! apache2ctl -M | grep -q 'brotli_module'; then
+    echo "Installing Brotli module for Apache..."
+    log_action "Installing Brotli module for Apache..."
+    apt-get install -y brotli
+
+    if [ $? -eq 0 ]; then
+        echo "Enabling Brotli module..."
+        a2enmod brotli
+        service apache2 restart || {
+            echo "Failed to restart Apache after enabling Brotli. Exiting..."
+            exit 1
+        }
+    else
+        echo "Failed to install Brotli module. Continuing without Brotli support..."
+        log_action "Failed to install Brotli module. Continuing without Brotli support..."
+    fi
+else
+    echo "Brotli module is already installed and enabled."
+    log_action "Brotli module is already installed and enabled."
+fi
+
+
+setfacl -R -m u:$USER:rwx,u:www-data:rwx /var/www
 
 # Prompt for MySQL root password and confirmation
 mysql_root_password=""
@@ -218,32 +286,42 @@ service mysql restart || {
     echo "Failed to restart MySQL. Exiting..."
     exit 1
 }
-
+# Accept optional PHP version parameter, default to 8.2
+PHP_VERSION=${1:-8.2}
 # PHP Setup
-echo "Installing PHP 8.2..."
+echo "Installing and configuring PHP $PHP_VERSION..."
 
 wget https://raw.githubusercontent.com/deforay/utility-scripts/master/php/switch-php -O /usr/local/bin/switch-php
 chmod u+x /usr/local/bin/switch-php
 
-switch-php 8.2
+switch-php $PHP_VERSION
 
 service apache2 restart || {
     echo "Failed to restart Apache2. Exiting..."
     exit 1
 }
 
-echo "Configuring PHP 8.2..."
-a2dismod $(ls /etc/apache2/mods-enabled | grep -oP '^php\d\.\d') -f
-a2enmod php8.2
-update-alternatives --set php /usr/bin/php8.2
-CLI_PHP_INI="/etc/php/8.2/cli/php.ini"
+echo "Configuring PHP..."
+
+# Disable the currently enabled PHP version if it's not the target version
+enabled_php_version=$(ls /etc/apache2/mods-enabled | grep -oP '^php\d\.\d')
+
+if [ -n "$enabled_php_version" ] && [ "$enabled_php_version" != "php$PHP_VERSION" ]; then
+    echo "Disabling PHP $enabled_php_version"
+    a2dismod $enabled_php_version
+else
+    echo "PHP $enabled_php_version is already the target version."
+fi
+a2enmod php$PHP_VERSION
+update-alternatives --set php /usr/bin/php$PHP_VERSION
+CLI_PHP_INI="/etc/php/$PHP_VERSION/cli/php.ini"
 if ! grep -q "apc.enable_cli=1" "$CLI_PHP_INI"; then
-    echo "apc.enable_cli=1" | tee -a "$CLI_PHP_INI"
+    echo "apc.enable_cli=1" | sudo tee -a "$CLI_PHP_INI"
 fi
 
-update-alternatives --set php "/usr/bin/php8.2"
-update-alternatives --set phar "/usr/bin/phar8.2"
-update-alternatives --set phar.phar "/usr/bin/phar.phar8.2"
+sudo update-alternatives --set php "/usr/bin/php$PHP_VERSION"
+sudo update-alternatives --set phar "/usr/bin/phar$PHP_VERSION"
+sudo update-alternatives --set phar.phar "/usr/bin/phar.phar$PHP_VERSION"
 
 service apache2 restart || {
     echo "Failed to restart Apache2. Exiting..."
@@ -261,15 +339,20 @@ desired_error_reporting="error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT & ~
 desired_post_max_size="post_max_size = 1G"
 desired_upload_max_filesize="upload_max_filesize = 1G"
 desired_memory_limit="memory_limit = $RAM_75_PERCENT"
+desired_strict_mode="session.use_strict_mode = 1"
+desired_max_execution_time="max_execution_time = 300"
 
-for phpini in /etc/php/8.2/apache2/php.ini /etc/php/8.2/cli/php.ini; do
+for phpini in /etc/php/$PHP_VERSION/apache2/php.ini /etc/php/$PHP_VERSION/cli/php.ini; do
     awk -v er="$desired_error_reporting" -v pms="$desired_post_max_size" \
         -v umf="$desired_upload_max_filesize" -v ml="$desired_memory_limit" \
+        -v dsm="$desired_strict_mode" -v met="$desired_max_execution_time" \
         '{
         if ($0 ~ /^error_reporting[[:space:]]*=/) {print ";" $0 "\n" er; next}
         if ($0 ~ /^post_max_size[[:space:]]*=/) {print ";" $0 "\n" pms; next}
         if ($0 ~ /^upload_max_filesize[[:space:]]*=/) {print ";" $0 "\n" umf; next}
         if ($0 ~ /^memory_limit[[:space:]]*=/) {print ";" $0 "\n" ml; next}
+        if ($0 ~ /^session.use_strict_mode[[:space:]]*=/) {print ";" $0 "\n" dsm; next}
+        if ($0 ~ /^max_execution_time[[:space:]]*=/) {print ";" $0 "\n" met; next}
         print $0
     }' $phpini >temp.ini && mv temp.ini $phpini
 done
@@ -345,6 +428,12 @@ else
     mv composer.phar /usr/local/bin/composer
 fi
 
-service apache2 restart
 
-echo "Setup complete."
+service apache2 restart || {
+    echo "Failed to restart Apache2. Exiting..."
+    log_action "Failed to restart Apache2. Exiting..."
+    exit 1
+}
+
+log_action "LAMP Setup complete."
+echo "LAMP Setup complete."
