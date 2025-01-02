@@ -356,3 +356,5 @@ service apache2 restart || {
 
 log_action "LAMP Setup complete."
 echo "LAMP Setup complete."
+
+export MYSQL_ROOT_PASSWORD="${mysql_root_password}"
