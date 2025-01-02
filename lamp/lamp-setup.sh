@@ -357,6 +357,5 @@ service apache2 restart || {
 log_action "LAMP Setup complete."
 echo "LAMP Setup complete."
 
-export MYSQL_ROOT_PASSWORD="${mysql_root_password}"
-echo "MYSQL_ROOT_PASSWORD=${mysql_root_password}" > /tmp/lamp-setup.env
-
+# Safely write password to environment file
+printf "MYSQL_ROOT_PASSWORD='%s'\n" "${mysql_root_password}" > /tmp/lamp-setup.env
