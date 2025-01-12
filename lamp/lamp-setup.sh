@@ -188,7 +188,7 @@ fi
 
 setfacl -R -m u:$USER:rwx,u:www-data:rwx /var/www
 
-# Prompt for MySQL root password and confirmation
+# Prompt for MySQL root password and configure mysql_config_editor
 mysql_root_password=""
 mysql_root_password_confirm=""
 while :; do # Infinite loop to keep asking until a correct password is provided
@@ -205,11 +205,21 @@ while :; do # Infinite loop to keep asking until a correct password is provided
         fi
     done
 
-    # MySQL Setup
+    # Verify MySQL password
     if command -v mysql &>/dev/null; then
         echo "MySQL is already installed. Verifying password..."
         if mysqladmin ping -u root -p"${mysql_root_password}" &>/dev/null; then
             echo "Password verified."
+
+            # Configure mysql_config_editor for secure login
+            echo "Configuring mysql_config_editor for secure login..."
+            echo "${mysql_root_password}" | mysql_config_editor set --login-path=rootuser --host=localhost --user=root --password
+            if [ $? -eq 0 ]; then
+                echo "MySQL login configured successfully."
+            else
+                echo "Failed to configure mysql_config_editor. Exiting..."
+                exit 1
+            fi
             break # Exit the loop if the password is correct
         else
             echo "Password incorrect or MySQL server unreachable. Please try again."
@@ -217,10 +227,10 @@ while :; do # Infinite loop to keep asking until a correct password is provided
             mysql_root_password_confirm=""
         fi
     else
-        echo "Installing MySQL..."
+        echo "MySQL is not installed. Installing MySQL..."
         apt-get install -y mysql-server
 
-        # Set MySQL root password and create databases
+        # Set MySQL root password and configure secure login
         echo "Setting MySQL root password..."
         mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${mysql_root_password}'; FLUSH PRIVILEGES;"
 
@@ -228,9 +238,19 @@ while :; do # Infinite loop to keep asking until a correct password is provided
             echo "Failed to restart MySQL. Exiting..."
             exit 1
         }
+
+        # Configure mysql_config_editor for secure login
+        echo "${mysql_root_password}" | mysql_config_editor set --login-path=rootuser --host=localhost --user=root --password
+        if [ $? -eq 0 ]; then
+            echo "MySQL login configured successfully."
+        else
+            echo "Failed to configure mysql_config_editor. Exiting..."
+            exit 1
+        fi
         break # Exit the loop after installing MySQL and setting the password
     fi
 done
+
 
 echo "Configuring MySQL..."
 desired_sql_mode="sql_mode ="
@@ -356,6 +376,3 @@ service apache2 restart || {
 
 log_action "LAMP Setup complete."
 echo "LAMP Setup complete."
-
-# Safely write password to environment file
-printf "MYSQL_ROOT_PASSWORD='%s'\n" "${mysql_root_password}" > /tmp/lamp-setup.env
