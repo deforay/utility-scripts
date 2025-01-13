@@ -198,21 +198,22 @@ while :; do # Infinite loop to keep asking until a correct password is provided
         fi
     done
 
+    echo "Configuring MySQL root password in ~/.my.cnf..."
+    cat <<EOF >~/.my.cnf
+[client]
+user=root
+password=${mysql_root_password}
+host=localhost
+EOF
+    chmod 600 ~/.my.cnf
+
     # Verify MySQL password
     if command -v mysql &>/dev/null; then
         echo "MySQL is already installed. Verifying password..."
         if mysqladmin ping -u root -p"${mysql_root_password}" &>/dev/null; then
             echo "Password verified."
 
-            # Configure mysql_config_editor for secure login
-            echo "Configuring mysql_config_editor for secure login..."
-            echo "${mysql_root_password}" | mysql_config_editor set --login-path=rootuser --host=localhost --user=root --password
-            if [ $? -eq 0 ]; then
-                echo "MySQL login configured successfully."
-            else
-                echo "Failed to configure mysql_config_editor. Exiting..."
-                exit 1
-            fi
+            echo "MySQL credentials configured successfully in ~/.my.cnf."
             break # Exit the loop if the password is correct
         else
             echo "Password incorrect or MySQL server unreachable. Please try again."
@@ -227,14 +228,8 @@ while :; do # Infinite loop to keep asking until a correct password is provided
         echo "Setting MySQL root password..."
         mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${mysql_root_password}'; FLUSH PRIVILEGES;"
 
-        # Configure mysql_config_editor for secure login
-        echo "${mysql_root_password}" | mysql_config_editor set --login-path=rootuser --host=localhost --user=root --password
-        if [ $? -eq 0 ]; then
-            echo "MySQL login configured successfully."
-        else
-            echo "Failed to configure mysql_config_editor. Exiting..."
-            exit 1
-        fi
+        # Restart MySQL to apply changes
+        service mysql restart
 
         service mysql restart || {
             echo "Failed to restart MySQL. Exiting..."
