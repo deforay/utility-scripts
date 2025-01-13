@@ -223,6 +223,10 @@ while :; do # Infinite loop to keep asking until a correct password is provided
         echo "MySQL is not installed. Installing MySQL..."
         apt-get install -y mysql-server
 
+        # Set MySQL root password and configure secure login
+        echo "Setting MySQL root password..."
+        mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${mysql_root_password}'; FLUSH PRIVILEGES;"
+
         # Configure mysql_config_editor for secure login
         echo "${mysql_root_password}" | mysql_config_editor set --login-path=rootuser --host=localhost --user=root --password
         if [ $? -eq 0 ]; then
@@ -231,10 +235,6 @@ while :; do # Infinite loop to keep asking until a correct password is provided
             echo "Failed to configure mysql_config_editor. Exiting..."
             exit 1
         fi
-
-        # Set MySQL root password and configure secure login
-        echo "Setting MySQL root password..."
-        mysql --login-path=rootuser -sse "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${mysql_root_password}'; FLUSH PRIVILEGES;"
 
         service mysql restart || {
             echo "Failed to restart MySQL. Exiting..."
