@@ -232,7 +232,7 @@ while :; do # Infinite loop to keep asking until a correct password is provided
 
         # Set MySQL root password and configure secure login
         echo "Setting MySQL root password..."
-        mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${mysql_root_password}'; FLUSH PRIVILEGES;"
+        mysql --login-path=rootuser -sse "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${mysql_root_password}'; FLUSH PRIVILEGES;"
 
         service mysql restart || {
             echo "Failed to restart MySQL. Exiting..."
