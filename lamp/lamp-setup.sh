@@ -13,7 +13,6 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-
 ask_yes_no() {
     local timeout=15
     local default=${2:-"no"} # set default value from the argument, fallback to "no" if not provided
@@ -66,7 +65,6 @@ log_action() {
     echo "$(date +'%Y-%m-%d %H:%M:%S') - $message" >>~/logsetup.log
 }
 
-
 error_handling() {
     local last_cmd=$1
     local last_line=$2
@@ -82,7 +80,6 @@ error_handling() {
         echo "This error is not critical, continuing..."
     fi
 }
-
 
 # Error trap
 trap 'error_handling "${BASH_COMMAND}" "$LINENO" "$?"' ERR
@@ -129,7 +126,6 @@ export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 update-locale
 
-
 # Check if SSH service is enabled
 if ! systemctl is-enabled ssh >/dev/null 2>&1; then
     echo "Enabling SSH service..."
@@ -146,7 +142,6 @@ else
     echo "SSH service is already running."
 fi
 
-
 # Apache Setup
 if command -v apache2 &>/dev/null; then
     echo "Apache is already installed. Skipping installation..."
@@ -161,7 +156,6 @@ else
         exit 1
     }
 fi
-
 
 # Check for Brotli support and install it if necessary
 if ! apache2ctl -M | grep -q 'brotli_module'; then
@@ -184,7 +178,6 @@ else
     echo "Brotli module is already installed and enabled."
     log_action "Brotli module is already installed and enabled."
 fi
-
 
 setfacl -R -m u:$USER:rwx,u:www-data:rwx /var/www
 
@@ -230,15 +223,6 @@ while :; do # Infinite loop to keep asking until a correct password is provided
         echo "MySQL is not installed. Installing MySQL..."
         apt-get install -y mysql-server
 
-        # Set MySQL root password and configure secure login
-        echo "Setting MySQL root password..."
-        mysql --login-path=rootuser -sse "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${mysql_root_password}'; FLUSH PRIVILEGES;"
-
-        service mysql restart || {
-            echo "Failed to restart MySQL. Exiting..."
-            exit 1
-        }
-
         # Configure mysql_config_editor for secure login
         echo "${mysql_root_password}" | mysql_config_editor set --login-path=rootuser --host=localhost --user=root --password
         if [ $? -eq 0 ]; then
@@ -247,10 +231,18 @@ while :; do # Infinite loop to keep asking until a correct password is provided
             echo "Failed to configure mysql_config_editor. Exiting..."
             exit 1
         fi
+
+        # Set MySQL root password and configure secure login
+        echo "Setting MySQL root password..."
+        mysql --login-path=rootuser -sse "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${mysql_root_password}'; FLUSH PRIVILEGES;"
+
+        service mysql restart || {
+            echo "Failed to restart MySQL. Exiting..."
+            exit 1
+        }
         break # Exit the loop after installing MySQL and setting the password
     fi
 done
-
 
 echo "Configuring MySQL..."
 desired_sql_mode="sql_mode ="
