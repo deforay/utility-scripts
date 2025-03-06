@@ -198,7 +198,7 @@ while :; do # Infinite loop to keep asking until a correct password is provided
         fi
     done
 
-    echo "Configuring MySQL root password in ~/.my.cnf..."
+    echo "Storing MySQL root password securely..."
     cat <<EOF >~/.my.cnf
 [client]
 user=root
@@ -213,7 +213,7 @@ EOF
         if mysqladmin ping -u root -p"${mysql_root_password}" &>/dev/null; then
             echo "Password verified."
 
-            echo "MySQL credentials configured successfully in ~/.my.cnf."
+            echo "MySQL credentials configured successfully."
             break # Exit the loop if the password is correct
         else
             echo "Password incorrect or MySQL server unreachable. Please try again."
@@ -247,52 +247,65 @@ desired_collation="collation-server=utf8mb4_general_ci"
 desired_auth_plugin="default_authentication_plugin=mysql_native_password"
 config_file="/etc/mysql/mysql.conf.d/mysqld.cnf"
 
-cp ${config_file} ${config_file}.bak
+# Check if config already has all our desired settings
+sql_mode_exists=$(grep -c "^${desired_sql_mode}" ${config_file} || true)
+innodb_mode_exists=$(grep -c "^${desired_innodb_strict_mode}" ${config_file} || true)
+charset_exists=$(grep -c "^${desired_charset}" ${config_file} || true)
+collation_exists=$(grep -c "^${desired_collation}" ${config_file} || true)
+auth_plugin_exists=$(grep -c "^${desired_auth_plugin}" ${config_file} || true)
 
-awk -v dsm="${desired_sql_mode}" -v dism="${desired_innodb_strict_mode}" \
-    -v dcharset="${desired_charset}" -v dcollation="${desired_collation}" \
-    -v dauth="${desired_auth_plugin}" \
-    'BEGIN { sql_mode_added=0; innodb_strict_mode_added=0; charset_added=0; collation_added=0; auth_plugin_added=0; }
-                /default_authentication_plugin[[:space:]]*=/ {
-                    if ($0 ~ dauth) {auth_plugin_added=1;}
-                    else {print ";" $0;}
-                    next;
-                }
-                /sql_mode[[:space:]]*=/ {
-                    if ($0 ~ dsm) {sql_mode_added=1;}
-                    else {print ";" $0;}
-                    next;
-                }
-                /innodb_strict_mode[[:space:]]*=/ {
-                    if ($0 ~ dism) {innodb_strict_mode_added=1;}
-                    else {print ";" $0;}
-                    next;
-                }
-                /character-set-server[[:space:]]*=/ {
-                    if ($0 ~ dcharset) {charset_added=1;}
-                    else {print ";" $0;}
-                    next;
-                }
-                /collation-server[[:space:]]*=/ {
-                    if ($0 ~ dcollation) {collation_added=1;}
-                    else {print ";" $0;}
-                    next;
-                }
-                /skip-external-locking|mysqlx-bind-address/ {
-                    print;
-                    if (sql_mode_added == 0) {print dsm; sql_mode_added=1;}
-                    if (innodb_strict_mode_added == 0) {print dism; innodb_strict_mode_added=1;}
-                    if (charset_added == 0) {print dcharset; charset_added=1;}
-                    if (collation_added == 0) {print dcollation; collation_added=1;}
-                    next;
-                }
-                { print; }' ${config_file} >tmpfile && mv tmpfile ${config_file}
+if [ $sql_mode_exists -gt 0 ] && [ $innodb_mode_exists -gt 0 ] && [ $charset_exists -gt 0 ] && [ $collation_exists -gt 0 ] && [ $auth_plugin_exists -gt 0 ]; then
+    echo "MySQL already has all the required configurations. Skipping configuration."
+else
+    echo "Some MySQL configurations need to be updated."
+    cp ${config_file} ${config_file}.bak
 
-service mysql restart || {
-    mv ${config_file}.bak ${config_file}
-    echo "Failed to restart MySQL. Exiting..."
-    exit 1
-}
+    awk -v dsm="${desired_sql_mode}" -v dism="${desired_innodb_strict_mode}" \
+        -v dcharset="${desired_charset}" -v dcollation="${desired_collation}" \
+        -v dauth="${desired_auth_plugin}" \
+        'BEGIN { sql_mode_added=0; innodb_strict_mode_added=0; charset_added=0; collation_added=0; auth_plugin_added=0; }
+                    /default_authentication_plugin[[:space:]]*=/ {
+                        if ($0 ~ dauth) {auth_plugin_added=1;}
+                        else {print ";" $0;}
+                        next;
+                    }
+                    /sql_mode[[:space:]]*=/ {
+                        if ($0 ~ dsm) {sql_mode_added=1;}
+                        else {print ";" $0;}
+                        next;
+                    }
+                    /innodb_strict_mode[[:space:]]*=/ {
+                        if ($0 ~ dism) {innodb_strict_mode_added=1;}
+                        else {print ";" $0;}
+                        next;
+                    }
+                    /character-set-server[[:space:]]*=/ {
+                        if ($0 ~ dcharset) {charset_added=1;}
+                        else {print ";" $0;}
+                        next;
+                    }
+                    /collation-server[[:space:]]*=/ {
+                        if ($0 ~ dcollation) {collation_added=1;}
+                        else {print ";" $0;}
+                        next;
+                    }
+                    /skip-external-locking|mysqlx-bind-address/ {
+                        print;
+                        if (sql_mode_added == 0) {print dsm; sql_mode_added=1;}
+                        if (innodb_strict_mode_added == 0) {print dism; innodb_strict_mode_added=1;}
+                        if (charset_added == 0) {print dcharset; charset_added=1;}
+                        if (collation_added == 0) {print dcollation; collation_added=1;}
+                        if (auth_plugin_added == 0) {print dauth; auth_plugin_added=1;}
+                        next;
+                    }
+                    { print; }' ${config_file} >tmpfile && mv tmpfile ${config_file}
+
+    service mysql restart || {
+        mv ${config_file}.bak ${config_file}
+        echo "Failed to restart MySQL. Exiting..."
+        exit 1
+    }
+fi
 # Accept optional PHP version parameter, default to 8.2
 PHP_VERSION=${1:-8.2}
 # PHP Setup
@@ -303,15 +316,15 @@ chmod u+x /usr/local/bin/switch-php
 
 switch-php $PHP_VERSION
 
+
 # phpMyAdmin Setup
-if [ ! -d "/var/www/phpmyadmin" ]; then
+if [ ! -d "/var/www/phpmyadmin" ] || [ -z "$(ls -A /var/www/phpmyadmin 2>/dev/null)" ]; then
     echo "Downloading and setting up phpMyAdmin..."
 
     # Create the directory if it does not exist
     mkdir -p /var/www/phpmyadmin
 
     # Download the ZIP file
-    # Replace the URL with the latest ZIP file URL from the phpMyAdmin website
     wget -q --show-progress --progress=dot:giga https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.zip
 
     # Extract directly into the /var/www/phpmyadmin directory
@@ -328,31 +341,40 @@ if [ ! -d "/var/www/phpmyadmin" ]; then
     mv /var/www/phpmyadmin/$PHPMYADMIN_DIR/* /var/www/phpmyadmin/
     mv /var/www/phpmyadmin/$PHPMYADMIN_DIR/.[!.]* /var/www/phpmyadmin/ 2>/dev/null
     rmdir /var/www/phpmyadmin/$PHPMYADMIN_DIR
+else
+    echo "phpMyAdmin is already installed. Skipping installation."
+fi
 
-    echo "Configuring Apache for phpMyAdmin..."
-    desired_alias="Alias /phpmyadmin /var/www/phpmyadmin"
-    config_file="/etc/apache2/sites-available/000-default.conf"
+echo "Checking Apache configuration for phpMyAdmin..."
+desired_alias="Alias /phpmyadmin /var/www/phpmyadmin"
+config_file="/etc/apache2/sites-available/000-default.conf"
 
-    # Check if the desired alias already exists
-    if ! grep -q "$desired_alias" ${config_file}; then
-        awk -v da="$desired_alias" \
-            'BEGIN {added=0; alias_added=0}
-        /Alias \/phpmyadmin[[:space:]]/ {
-            if ($0 !~ da) {print ";" $0} else {alias_added=1; print $0}
-            next;
+# Check if the desired alias already exists
+if grep -q "$desired_alias" ${config_file}; then
+    echo "phpMyAdmin alias already exists in Apache configuration."
+else
+    echo "Adding phpMyAdmin alias to Apache configuration..."
+    awk -v da="$desired_alias" \
+        'BEGIN {added=0; alias_added=0}
+    /Alias \/phpmyadmin[[:space:]]/ {
+        if ($0 !~ da) {print ";" $0} else {alias_added=1; print $0}
+        next;
+    }
+    /ServerAdmin|DocumentRoot/ {
+        print;
+        if (added == 0 && alias_added == 0) {
+            print da;
+            added=1;
         }
-        /ServerAdmin|DocumentRoot/ {
-            print;
-            if (added == 0 && alias_added == 0) {
-                print da;
-                added=1;
-            }
-            next;
-        }
-        { print }' ${config_file} >tmpfile && mv tmpfile ${config_file}
-    fi
+        next;
+    }
+    { print }' ${config_file} >tmpfile && mv tmpfile ${config_file}
 
-    service apache2 restart
+    service apache2 restart || {
+        echo "Failed to restart Apache2. Exiting..."
+        log_action "Failed to restart Apache2. Exiting..."
+        exit 1
+    }
 fi
 
 service apache2 restart || {
