@@ -3,7 +3,7 @@
 # To use this script:
 # sudo -s
 # cd /tmp
-# wget https://raw.githubusercontent.com/deforay/utility-scripts/master/lamp/lamp-setup.sh
+# wget -O ./lamp-setup.sh https://raw.githubusercontent.com/deforay/utility-scripts/master/lamp/lamp-setup.sh
 # chmod +x ./lamp-setup.sh
 # ./lamp-setup.sh [PHP_VERSION]
 
@@ -84,12 +84,28 @@ error_handling() {
 # Error trap
 trap 'error_handling "${BASH_COMMAND}" "$LINENO" "$?"' ERR
 
-# Check if Ubuntu version is 20.04 or newer
-min_version="22.04"
-current_version=$(lsb_release -rs)
+# Check if running on an LTS Ubuntu release and meets minimum version
+is_valid_ubuntu() {
+    # Check if the current release is an LTS release
+    if ! lsb_release -d | grep -q "LTS"; then
+        echo "This script only runs on Ubuntu LTS releases."
+        return 1
+    fi
 
-if [[ "$(printf '%s\n' "$min_version" "$current_version" | sort -V | head -n1)" != "$min_version" ]]; then
-    echo "This script is not compatible with Ubuntu versions older than ${min_version}."
+    # Check minimum version requirement
+    local min_version="22.04"
+    local current_version=$(lsb_release -rs)
+
+    if [[ "$(printf '%s\n' "$min_version" "$current_version" | sort -V | head -n1)" != "$min_version" ]]; then
+        echo "This script requires Ubuntu ${min_version} LTS or newer."
+        return 1
+    fi
+
+    return 0 # Valid LTS release that meets minimum version
+}
+
+# Replace the existing Ubuntu version check with this check
+if ! is_valid_ubuntu; then
     exit 1
 fi
 
