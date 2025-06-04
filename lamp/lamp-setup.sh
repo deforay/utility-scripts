@@ -7,9 +7,42 @@
 # chmod +x ./lamp-setup.sh
 # ./lamp-setup.sh [PHP_VERSION]
 
+# Define a unified print function that colors the entire message
+print() {
+    local type=$1
+    local message=$2
+
+    case $type in
+    error)
+        echo -e "\033[0;31mError: $message\033[0m"
+        ;;
+    success)
+        echo -e "\033[0;32mSuccess: $message\033[0m"
+        ;;
+    warning)
+        echo -e "\033[0;33mWarning: $message\033[0m"
+        ;;
+    info)
+        # Changed from blue (\033[0;34m) to teal/turquoise (\033[0;36m)
+        echo -e "\033[0;36mInfo: $message\033[0m"
+        ;;
+    debug)
+        # Using a lighter cyan color for debug messages
+        echo -e "\033[1;36mDebug: $message\033[0m"
+        ;;
+    header)
+        # Changed from blue to a brighter cyan/teal
+        echo -e "\033[1;36m==== $message ====\033[0m"
+        ;;
+    *)
+        echo "$message"
+        ;;
+    esac
+}
+
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then
-    echo "Need admin privileges for this script. Run sudo -s before running this script or run this script with sudo"
+    print error "Need admin privileges for this script. Run sudo -s before running this script or run this script with sudo"
     exit 1
 fi
 
@@ -69,15 +102,15 @@ error_handling() {
     local last_cmd=$1
     local last_line=$2
     local last_error=$3
-    echo "Error on or near line ${last_line}; command executed was '${last_cmd}' which exited with status ${last_error}"
+    print error "Error on or near line ${last_line}; command executed was '${last_cmd}' which exited with status ${last_error}"
     log_action "Error on or near line ${last_line}; command executed was '${last_cmd}' which exited with status ${last_error}"
 
     # Check if the error is critical
     if [ "$last_error" -eq 1 ]; then # Adjust according to the error codes you consider critical
-        echo "This error is critical, exiting..."
+        print error "This error is critical, exiting..."
         exit 1
     else
-        echo "This error is not critical, continuing..."
+        print info "This error is not critical, continuing..."
     fi
 }
 
@@ -88,7 +121,7 @@ trap 'error_handling "${BASH_COMMAND}" "$LINENO" "$?"' ERR
 is_valid_ubuntu() {
     # Check if the current release is an LTS release
     if ! lsb_release -d | grep -q "LTS"; then
-        echo "This script only runs on Ubuntu LTS releases."
+        print error "This script only runs on Ubuntu LTS releases."
         return 1
     fi
 
@@ -97,7 +130,7 @@ is_valid_ubuntu() {
     local current_version=$(lsb_release -rs)
 
     if [[ "$(printf '%s\n' "$min_version" "$current_version" | sort -V | head -n1)" != "$min_version" ]]; then
-        echo "This script requires Ubuntu ${min_version} LTS or newer."
+        print error "This script requires Ubuntu ${min_version} LTS or newer."
         return 1
     fi
 
@@ -112,7 +145,7 @@ fi
 # Check for dependencies
 for cmd in "apt-get"; do
     if ! command -v $cmd &>/dev/null; then
-        echo "$cmd is not installed. Exiting..."
+        print error "$cmd is not installed. Exiting..."
         exit 1
     fi
 done
@@ -130,13 +163,13 @@ dpkg --configure -a
 apt-get autoremove -y
 
 echo "Installing basic packages..."
-apt-get install -y build-essential software-properties-common gnupg apt-transport-https ca-certificates lsb-release wget vim zip unzip curl acl snapd rsync git gdebi net-tools sed mawk magic-wormhole openssh-server libsodium-dev mosh
+apt-get install -y build-essential software-properties-common gnupg apt-transport-https ca-certificates lsb-release wget vim zip unzip curl acl snapd rsync git gdebi net-tools sed mawk magic-wormhole openssh-server libsodium-dev mosh aria2
 
 if ! grep -q "ondrej/apache2" /etc/apt/sources.list /etc/apt/sources.list.d/*; then
     add-apt-repository ppa:ondrej/apache2 -y
 fi
 
-echo "Setting up locale..."
+print header "Setting up locale..."
 locale-gen en_US en_US.UTF-8
 export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
@@ -144,10 +177,10 @@ update-locale
 
 # Check if SSH service is enabled
 if ! systemctl is-enabled ssh >/dev/null 2>&1; then
-    echo "Enabling SSH service..."
+    print info "Enabling SSH service..."
     systemctl enable ssh
 else
-    echo "SSH service is already enabled."
+    print info "SSH service is already enabled."
 fi
 
 # Check if SSH service is running
@@ -255,7 +288,7 @@ EOF
     fi
 done
 
-echo "Configuring MySQL..."
+print header "Configuring MySQL..."
 desired_sql_mode="sql_mode ="
 desired_innodb_strict_mode="innodb_strict_mode = 0"
 desired_charset="character-set-server=utf8mb4"
@@ -322,16 +355,30 @@ else
         exit 1
     }
 fi
+
+print info "Applying SET PERSIST sql_mode='' to override MySQL defaults..."
+
+persist_result=$(MYSQL_PWD="${mysql_root_password}" mysql -u root -e "SET PERSIST sql_mode = '';" 2>&1)
+persist_status=$?
+
+if [ $persist_status -eq 0 ]; then
+    print success "Successfully persisted sql_mode=''"
+    log_action "Applied SET PERSIST sql_mode = '';"
+else
+    print warning "SET PERSIST failed: $persist_result"
+    log_action "SET PERSIST sql_mode failed: $persist_result"
+fi
+
+
 # Accept optional PHP version parameter, default to 8.2
 PHP_VERSION=${1:-8.2}
 # PHP Setup
-echo "Installing and configuring PHP $PHP_VERSION..."
+print info "Installing and configuring PHP $PHP_VERSION..."
 
 wget https://raw.githubusercontent.com/deforay/utility-scripts/master/php/switch-php -O /usr/local/bin/switch-php
 chmod u+x /usr/local/bin/switch-php
 
 switch-php $PHP_VERSION
-
 
 # phpMyAdmin Setup
 if [ ! -d "/var/www/phpmyadmin" ] || [ -z "$(ls -A /var/www/phpmyadmin 2>/dev/null)" ]; then
@@ -361,13 +408,13 @@ else
     echo "phpMyAdmin is already installed. Skipping installation."
 fi
 
-echo "Checking Apache configuration for phpMyAdmin..."
+print info "Checking Apache configuration for phpMyAdmin..."
 desired_alias="Alias /phpmyadmin /var/www/phpmyadmin"
 config_file="/etc/apache2/sites-available/000-default.conf"
 
 # Check if the desired alias already exists
 if grep -q "$desired_alias" ${config_file}; then
-    echo "phpMyAdmin alias already exists in Apache configuration."
+    print info "phpMyAdmin alias already exists in Apache configuration."
 else
     echo "Adding phpMyAdmin alias to Apache configuration..."
     awk -v da="$desired_alias" \
@@ -387,17 +434,17 @@ else
     { print }' ${config_file} >tmpfile && mv tmpfile ${config_file}
 
     service apache2 restart || {
-        echo "Failed to restart Apache2. Exiting..."
+        print error "Failed to restart Apache2. Exiting..."
         log_action "Failed to restart Apache2. Exiting..."
         exit 1
     }
 fi
 
 service apache2 restart || {
-    echo "Failed to restart Apache2. Exiting..."
+    print error "Failed to restart Apache2. Exiting..."
     log_action "Failed to restart Apache2. Exiting..."
     exit 1
 }
 
 log_action "LAMP Setup complete."
-echo "LAMP Setup complete."
+print info "LAMP Setup complete."
