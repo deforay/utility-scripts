@@ -358,7 +358,8 @@ fi
 
 print info "Applying SET PERSIST sql_mode='' to override MySQL defaults..."
 
-persist_result=$(MYSQL_PWD="${mysql_root_password}" mysql -u root -e "SET PERSIST sql_mode = '';" 2>&1)
+persist_result=$(MYSQL_PWD="${mysql_root_password}" mysql -u root -e "SET PERSIST sql_mode=''" 2>&1)
+
 persist_status=$?
 
 if [ $persist_status -eq 0 ]; then
