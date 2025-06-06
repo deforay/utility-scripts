@@ -356,19 +356,18 @@ else
     }
 fi
 
-print info "Applying SET PERSIST sql_mode='' to override MySQL defaults..."
+# print info "Applying SET PERSIST sql_mode='' to override MySQL defaults..."
 
-persist_result=$(MYSQL_PWD="${mysql_root_password}" mysql -u root -e "SET PERSIST sql_mode=''" 2>&1)
+# persist_result=$(MYSQL_PWD="${mysql_root_password}" mysql -u root -e "SET PERSIST sql_mode = '';" 2>&1)
+# persist_status=$?
 
-persist_status=$?
-
-if [ $persist_status -eq 0 ]; then
-    print success "Successfully persisted sql_mode=''"
-    log_action "Applied SET PERSIST sql_mode = '';"
-else
-    print warning "SET PERSIST failed: $persist_result"
-    log_action "SET PERSIST sql_mode failed: $persist_result"
-fi
+# if [ $persist_status -eq 0 ]; then
+#     print success "Successfully persisted sql_mode=''"
+#     log_action "Applied SET PERSIST sql_mode = '';"
+# else
+#     print warning "SET PERSIST failed: $persist_result"
+#     log_action "SET PERSIST sql_mode failed: $persist_result"
+# fi
 
 
 # Accept optional PHP version parameter, default to 8.2
