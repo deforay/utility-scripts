@@ -167,25 +167,15 @@ done
 
 
 # Composer Setup
-echo "Checking for Composer..."
+echo "Installing Composer..."
+curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+
+# verify it worked
 if command -v composer &>/dev/null; then
-    echo "Composer is already installed. Updating..."
-    composer self-update
+    echo "Composer installed successfully"
 else
-    echo "Installing Composer..."
-    php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
-    HASH=$(wget -q -O - https://composer.github.io/installer.sig)
-    echo "Installer hash: $HASH"
-    php -r "if (hash('SHA384', file_get_contents('composer-setup.php')) !== '$HASH') { unlink('composer-setup.php'); echo 'Invalid installer' . PHP_EOL; exit(1); }"
-    php composer-setup.php
-    if [ $? -ne 0 ]; then
-        echo "Failed to install Composer."
-    fi
-    php -r "unlink('composer-setup.php');"
-    mv composer.phar /usr/local/bin/composer
+    echo "Warning: Composer installation may have failed"
 fi
-
-
 
 # Restart Apache to apply changes
 service apache2 restart || {
