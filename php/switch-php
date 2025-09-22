@@ -1,185 +1,297 @@
 #!/bin/bash
+set -euo pipefail
 
 # To use this script:
 # sudo wget https://raw.githubusercontent.com/deforay/utility-scripts/master/php/switch-php -O /usr/local/bin/switch-php
 # sudo chmod +x /usr/local/bin/switch-php
 # sudo switch-php 7.4
 # sudo switch-php 8.2
+# sudo switch-php 8.3
 
-# Check if running as root
-if [ "$EUID" -ne 0 ]; then
-    echo "Please run as root."
-    exit 1
+# Root check
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+  echo "Please run as root."
+  exit 1
 fi
 
-# Check if the OS is Ubuntu 20.04 or higher
+# Ubuntu 20.04+
 check_ubuntu_version() {
-    . /etc/os-release
-    if [ "$ID" != "ubuntu" ]; then
-        echo "This script is intended for Ubuntu."
-        exit 1
-    fi
-
-    VERSION_ID=${VERSION_ID%.*} # Get the major version number
-    if [ "$VERSION_ID" -lt 20 ]; then
-        echo "This script requires Ubuntu 20.04 or higher."
-        exit 1
-    fi
+  . /etc/os-release
+  if [ "${ID:-}" != "ubuntu" ]; then
+    echo "This script is intended for Ubuntu."
+    exit 1
+  fi
+  VERSION_MAJOR="${VERSION_ID%.*}"
+  if [ "${VERSION_MAJOR:-0}" -lt 20 ]; then
+    echo "This script requires Ubuntu 20.04 or higher."
+    exit 1
+  fi
 }
-
 check_ubuntu_version
 
-# Check if the user provided a PHP version
-if [ -z "$1" ]; then
-    echo "Please provide a PHP version (e.g., 7.4, 8.0, 8.1, 8.2)"
-    exit 1
+# Target PHP version
+if [ $# -lt 1 ]; then
+  echo "Provide PHP version (e.g., 7.4, 8.0, 8.1, 8.2, 8.3)"
+  exit 1
 fi
+PHP_VERSION="$1"
 
-PHP_VERSION=$1
-
-# Update and install necessary packages
-apt-get update && apt-get upgrade -y && apt-get autoremove -y
-
+# Refresh base packages
+apt-get update
+apt-get -y upgrade
+apt-get -y autoremove
 dpkg --configure -a
 
-apt-get install -y build-essential software-properties-common gnupg apt-transport-https ca-certificates lsb-release wget vim zip unzip curl acl snapd rsync git gdebi net-tools sed mawk magic-wormhole openssh-server libsodium-dev
+apt-get install -y \
+  build-essential software-properties-common gnupg apt-transport-https \
+  ca-certificates lsb-release wget vim zip unzip curl acl snapd rsync git \
+  gdebi net-tools sed mawk magic-wormhole openssh-server libsodium-dev \
+  mosh aria2 imagemagick
 
-# Add Ondřej Surý's PPA if it's not already added
-if ! grep -q "ondrej/php" /etc/apt/sources.list /etc/apt/sources.list.d/*; then
-    add-apt-repository ppa:ondrej/php -y
-    apt-get update -y
+# Add Ondřej’s PPAs (idempotent) and update
+echo "Adding Ondřej repositories..."
+LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php || true
+LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/apache2 || true
+apt-get update
+
+# Verify PPA presence
+if ! ls /etc/apt/sources.list.d/ondrej-ubuntu-php* >/dev/null 2>&1; then
+  echo "⚠ Ondřej PHP PPA list file not found"
 fi
 
-# Check if the PHP version is already installed
-if ! command -v php$PHP_VERSION >/dev/null 2>&1; then
-    echo "PHP $PHP_VERSION is not installed. Installing now..."
+# Prefer PPA packages
+cat >/etc/apt/preferences.d/ondrej-php.pref <<'EOF'
+Package: php*
+Pin: release o=LP-PPA-ondrej-php
+Pin-Priority: 700
 
-    # Install the requested PHP version and its core components
-    apt-get install -y "php$PHP_VERSION" "libapache2-mod-php$PHP_VERSION"
+Package: apache2*
+Pin: release o=LP-PPA-ondrej-apache2
+Pin-Priority: 700
+EOF
+apt-get update
+
+# Force apt to pick from the PPA when available
+APT_PPA_TARGET="-t o=LP-PPA-ondrej-php"
+
+# Ensure base PHP + Apache module
+if ! command -v "php${PHP_VERSION}" >/dev/null 2>&1; then
+  echo "Installing PHP ${PHP_VERSION}..."
+  apt-get install -y $APT_PPA_TARGET "php${PHP_VERSION}" "libapache2-mod-php${PHP_VERSION}"
 else
-    echo "PHP $PHP_VERSION is already installed."
+  echo "PHP ${PHP_VERSION} is already installed."
 fi
 
-# Define the list of extensions to be installed
-extensions=(
-    "common"
-    "cli"
-    "json"
-    "mysql"
-    "pdo_mysql"
-    "zip"
-    "gd"
-    "mbstring"
-    "curl"
-    "xml"
-    "xmlrpc"
-    "bcmath"
-    "gmp"
-    "intl"
-    "imagick"
-    "apcu"
-    "opcache"
-    "memcache"
-    "memcached"
-    "redis"
-    "sqlite3"
-)
+# Helpers
+package_exists() { apt-cache show "$1" >/dev/null 2>&1; }
 
-# Install required extensions if they are not already installed
-for extension in "${extensions[@]}"; do
-    if ! dpkg -l | grep -q "php$PHP_VERSION-$extension"; then
-        echo "Installing php$PHP_VERSION-$extension..."
-        # Check if the package is available before trying to install it
-        if apt-cache search "php$PHP_VERSION-$extension" | grep -q "php$PHP_VERSION-$extension"; then
-            apt-get install -y "php$PHP_VERSION-$extension" || {
-                echo "Failed to install php$PHP_VERSION-$extension. Logging error and continuing."
-                echo "Failed to install php$PHP_VERSION-$extension" >>/var/log/php-switch-error.log
-            }
-        else
-            echo "Package php$PHP_VERSION-$extension not found in the repository. Skipping."
-            echo "Package php$PHP_VERSION-$extension not found" >>/var/log/php-switch-error.log
-        fi
-    else
-        echo "php$PHP_VERSION-$extension is already installed."
+install_extension() {
+  local ext_name="$1"
+  local pkg="php${PHP_VERSION}-${ext_name}"
+
+  # Special-case redis (often unversioned as php-redis)
+  if [ "$ext_name" = "redis" ]; then
+    if ! php -m | grep -qi '^redis$'; then
+      echo "Installing php-redis from PPA..."
+      if ! apt-get install -y $APT_PPA_TARGET php-redis; then
+        echo "Failed to install php-redis" >>/var/log/php-switch-error.log
+        return 1
+      fi
     fi
-done
+    echo "✓ redis loaded/installed"
+    return 0
+  fi
 
-# Enable the requested PHP version
-echo "Enabling PHP $PHP_VERSION"
-# Disable the currently enabled PHP version if it's not the target version
-enabled_php_version=$(ls /etc/apache2/mods-enabled | grep -oP '^php\d\.\d')
+  # Normal versioned package path
+  if dpkg -l | grep -q "^ii\s\+${pkg}\s"; then
+    echo "✓ ${pkg} already installed"
+    return 0
+  fi
 
-if [ -n "$enabled_php_version" ] && [ "$enabled_php_version" != "php$PHP_VERSION" ]; then
-    echo "Disabling PHP $enabled_php_version"
-    a2dismod $enabled_php_version
-else
-    echo "PHP $enabled_php_version is already the target version."
-fi
-a2enmod php$PHP_VERSION
+  echo "Installing ${pkg}..."
+  if package_exists "${pkg}" && apt-get install -y $APT_PPA_TARGET "${pkg}"; then
+    echo "✓ Installed ${pkg}"
+    return 0
+  fi
 
-update-alternatives --set php "/usr/bin/php$PHP_VERSION"
-update-alternatives --set phar "/usr/bin/phar$PHP_VERSION"
-update-alternatives --set phar.phar "/usr/bin/phar.phar$PHP_VERSION"
+  # sqlite3 may be missing for some PHP/Ubuntu combos on focal
+  if [ "$ext_name" = "sqlite3" ]; then
+    echo "✗ ${pkg} not available from PPA on this release" | tee -a /var/log/php-switch-error.log
+    echo "  → Consider PHP 8.3 on focal (php8.3-sqlite3) or upgrade to Ubuntu 22.04/24.04." | tee -a /var/log/php-switch-error.log
+    return 1
+  fi
 
-CLI_PHP_INI="/etc/php/$PHP_VERSION/cli/php.ini"
-if ! grep -q "apc.enable_cli=1" "$CLI_PHP_INI"; then
-    echo "apc.enable_cli=1" | sudo tee -a "$CLI_PHP_INI"
-fi
-
-
-# Restart Apache to apply changes
-service apache2 restart || {
-    echo "Failed to restart Apache. Please check the configuration."
-    exit 1
+  echo "✗ Could not install ${pkg}" | tee -a /var/log/php-switch-error.log
+  return 1
 }
 
-echo "Switched to PHP $PHP_VERSION"
-echo "PHP CLI version switched"
+# Core extensions (keep names that actually exist)
+extensions=(
+  common
+  cli
+  mysql      # provides pdo_mysql + mysqli
+  zip
+  gd
+  mbstring
+  curl
+  xml
+  bcmath
+  gmp
+  intl
+  opcache
+  sqlite3    # may be absent for PHP 8.2 on focal; handled in install_extension()
+)
 
+optional_extensions=(
+  apcu
+  memcached
+  redis
+)
 
-# Modify php.ini as needed
-echo "Modifying PHP configurations..."
+echo "Installing core PHP extensions..."
+for ext in "${extensions[@]}"; do
+  install_extension "$ext" || true
+done
 
-# Get total RAM and calculate 75%
-TOTAL_RAM=$(awk '/MemTotal/ {print $2}' /proc/meminfo) || exit 1
-RAM_75_PERCENT=$((TOTAL_RAM * 3 / 4 / 1024))M || RAM_75_PERCENT=1G
+echo "Installing optional PHP extensions..."
+for ext in "${optional_extensions[@]}"; do
+  install_extension "$ext" || true
+done
+
+# Imagick (unversioned in PPA)
+echo "Installing php-imagick (PPA)…"
+apt-get install -y $APT_PPA_TARGET php-imagick || echo "php-imagick failed" >>/var/log/php-switch-error.log
+
+# Apache module switch
+echo "Configuring Apache for PHP ${PHP_VERSION}..."
+enabled_php_versions=$(ls /etc/apache2/mods-enabled/ 2>/dev/null | grep -oP '^php\d\.\d' | sort -u || true)
+for ev in $enabled_php_versions; do
+  if [ "$ev" != "php${PHP_VERSION}" ]; then
+    echo "Disabling $ev"
+    a2dismod "$ev" || true
+  fi
+done
+echo "Enabling php${PHP_VERSION} module"
+a2enmod "php${PHP_VERSION}" || true
+
+# CLI alternatives
+echo "Setting PHP ${PHP_VERSION} as default CLI..."
+update-alternatives --set php "/usr/bin/php${PHP_VERSION}" || true
+update-alternatives --set phar "/usr/bin/phar${PHP_VERSION}" 2>/dev/null || true
+update-alternatives --set phar.phar "/usr/bin/phar.phar${PHP_VERSION}" 2>/dev/null || true
+
+# php.ini tweaks
+CLI_PHP_INI="/etc/php/${PHP_VERSION}/cli/php.ini"
+if [ -f "$CLI_PHP_INI" ] && ! grep -q "apc.enable_cli=1" "$CLI_PHP_INI"; then
+  echo "apc.enable_cli=1" >>"$CLI_PHP_INI"
+fi
+
+echo "Restarting Apache..."
+service apache2 restart
+
+echo "✓ Switched to PHP ${PHP_VERSION}"
+echo "✓ PHP CLI version switched"
+
+# Config tuning
+echo "Configuring PHP settings..."
+TOTAL_RAM_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo || echo 0)
+if [ "$TOTAL_RAM_KB" -gt 0 ]; then
+  RAM_75_MB=$((TOTAL_RAM_KB * 3 / 4 / 1024))
+  MEMORY_LIMIT="${RAM_75_MB}M"
+else
+  MEMORY_LIMIT="1024M"
+fi
 
 desired_error_reporting="error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT & ~E_NOTICE & ~E_WARNING"
 desired_post_max_size="post_max_size = 1G"
 desired_upload_max_filesize="upload_max_filesize = 1G"
-desired_memory_limit="memory_limit = $RAM_75_PERCENT"
+desired_memory_limit="memory_limit = ${MEMORY_LIMIT}"
 desired_strict_mode="session.use_strict_mode = 1"
 desired_max_execution_time="max_execution_time = 300"
 
-for phpini in /etc/php/$PHP_VERSION/apache2/php.ini /etc/php/$PHP_VERSION/cli/php.ini; do
-    awk -v er="$desired_error_reporting" -v pms="$desired_post_max_size" \
-        -v umf="$desired_upload_max_filesize" -v ml="$desired_memory_limit" \
-        -v dsm="$desired_strict_mode" -v met="$desired_max_execution_time" \
-        '{
-        if ($0 ~ /^error_reporting[[:space:]]*=/) {print ";" $0 "\n" er; next}
-        if ($0 ~ /^post_max_size[[:space:]]*=/) {print ";" $0 "\n" pms; next}
-        if ($0 ~ /^upload_max_filesize[[:space:]]*=/) {print ";" $0 "\n" umf; next}
-        if ($0 ~ /^memory_limit[[:space:]]*=/) {print ";" $0 "\n" ml; next}
-        if ($0 ~ /^session.use_strict_mode[[:space:]]*=/) {print ";" $0 "\n" dsm; next}
-        if ($0 ~ /^max_execution_time[[:space:]]*=/) {print ";" $0 "\n" met; next}
+for phpini in "/etc/php/${PHP_VERSION}/apache2/php.ini" "/etc/php/${PHP_VERSION}/cli/php.ini"; do
+  [ -f "$phpini" ] || continue
+  echo "Updating $phpini..."
+  awk -v er="$desired_error_reporting" -v pms="$desired_post_max_size" \
+      -v umf="$desired_upload_max_filesize" -v ml="$desired_memory_limit" \
+      -v dsm="$desired_strict_mode" -v met="$desired_max_execution_time" \
+      '{
+        if ($0 ~ /^error_reporting[[:space:]]*=/)         {print ";" $0 "\n" er;  next}
+        if ($0 ~ /^post_max_size[[:space:]]*=/)           {print ";" $0 "\n" pms; next}
+        if ($0 ~ /^upload_max_filesize[[:space:]]*=/)     {print ";" $0 "\n" umf; next}
+        if ($0 ~ /^memory_limit[[:space:]]*=/)            {print ";" $0 "\n" ml;  next}
+        if ($0 ~ /^session\.use_strict_mode[[:space:]]*=/){print ";" $0 "\n" dsm; next}
+        if ($0 ~ /^max_execution_time[[:space:]]*=/)      {print ";" $0 "\n" met; next}
         print $0
-    }' $phpini >temp.ini && mv temp.ini $phpini
+      }' "$phpini" >"${phpini}.tmp" && mv "${phpini}.tmp" "$phpini"
 done
 
-
-# Composer Setup
+# Composer
 echo "Installing Composer..."
 curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
-
-# verify it worked
-if command -v composer &>/dev/null; then
-    echo "Composer installed successfully"
+if command -v composer >/dev/null 2>&1; then
+  echo "✓ Composer installed successfully"
 else
-    echo "Warning: Composer installation may have failed"
+  echo "⚠ Composer installation may have failed"
 fi
 
-# Restart Apache to apply changes
-service apache2 restart || {
-    echo "Failed to restart Apache. Please check the configuration."
-    exit 1
-}
+# Final restart
+echo "Final Apache restart..."
+service apache2 restart
+
+# Report
+echo
+echo "=================================================="
+echo "      PHP SWITCH INSTALLATION REPORT"
+echo "=================================================="
+echo "PHP Version: $(php --version | head -n1)"
+echo "Apache Module: $(apache2ctl -M 2>/dev/null | grep php || echo 'Not found')"
+echo
+echo "Loaded Extensions:"
+php -m | grep -E "(sqlite|pdo|mysql|redis|curl|gd|zip|json|xml)" | sort || true
+
+echo
+echo "SQLite Support Check:"
+if php -m | grep -qi '^sqlite3$'; then
+  echo "✓ sqlite3 extension is loaded"
+  php -r "
+    if (class_exists('SQLite3')) {
+      echo \"✓ SQLite3 class is available\n\";
+      echo '  Version: ' . SQLite3::version()['versionString'] . \"\n\";
+    }
+    if (class_exists('PDO')) {
+      \$drivers = PDO::getAvailableDrivers();
+      if (in_array('sqlite', \$drivers)) {
+        echo \"✓ SQLite PDO driver is available\n\";
+      } else {
+        echo \"✗ SQLite PDO driver is NOT available\n\";
+      }
+      echo '  Available PDO drivers: ' . implode(', ', \$drivers) . \"\n\";
+    }
+  " 2>/dev/null || true
+else
+  echo "✗ sqlite3 extension not loaded"
+  echo "  → Install php${PHP_VERSION}-sqlite3 (if available) or use PHP 8.3 on focal / upgrade to 22.04+."
+fi
+
+echo
+echo "Redis Support Check:"
+if php -m | grep -qi '^redis$'; then
+  echo "✓ redis extension is loaded"
+else
+  echo "⚠ redis extension not loaded"
+fi
+
+echo
+if [ -f /var/log/php-switch-error.log ]; then
+  echo "Installation Issues Found:"
+  echo "------------------------"
+  cat /var/log/php-switch-error.log || true
+else
+  echo "✓ No installation errors detected"
+fi
+
+echo
+echo "=================================================="
+echo "Installation complete! PHP ${PHP_VERSION} is now active."
+echo "=================================================="
