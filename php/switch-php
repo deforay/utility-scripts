@@ -82,6 +82,7 @@ extensions=(
     "memcache"
     "memcached"
     "redis"
+    "sqlite3"
 )
 
 # Install required extensions if they are not already installed
