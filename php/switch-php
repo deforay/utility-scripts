@@ -7,6 +7,8 @@ set -euo pipefail
 # sudo switch-php 7.4
 # sudo switch-php 8.2
 # sudo switch-php 8.3
+# sudo switch-php 8.2 -f
+# sudo switch-php 8.2 --force
 
 # Root check
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
@@ -29,12 +31,24 @@ check_ubuntu_version() {
 }
 check_ubuntu_version
 
-# Target PHP version
+# Parse arguments
 if [ $# -lt 1 ]; then
   echo "Provide PHP version (e.g., 7.4, 8.0, 8.1, 8.2, 8.3)"
+  echo "Options:"
+  echo "  -f, --force    Force reinstall PHP, extensions, and Composer"
   exit 1
 fi
+
 PHP_VERSION="$1"
+FORCE_MODE=false
+
+# Check for force flag
+if [ $# -ge 2 ]; then
+  if [ "$2" = "-f" ] || [ "$2" = "--force" ]; then
+    FORCE_MODE=true
+    echo "Force mode enabled: will reinstall PHP, extensions, and Composer"
+  fi
+fi
 
 # Refresh base packages
 apt-get update
@@ -48,7 +62,7 @@ apt-get install -y \
   gdebi net-tools sed mawk magic-wormhole openssh-server libsodium-dev \
   mosh aria2 imagemagick
 
-# Add Ondřej’s PPAs (idempotent) and update
+# Add Ondřej's PPAs (idempotent) and update
 echo "Adding Ondřej repositories..."
 LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php || true
 LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/apache2 || true
@@ -75,7 +89,7 @@ apt-get update
 APT_PPA_TARGET="-t o=LP-PPA-ondrej-php"
 
 # Ensure base PHP + Apache module
-if ! command -v "php${PHP_VERSION}" >/dev/null 2>&1; then
+if ! command -v "php${PHP_VERSION}" >/dev/null 2>&1 || [ "$FORCE_MODE" = true ]; then
   echo "Installing PHP ${PHP_VERSION}..."
   apt-get install -y $APT_PPA_TARGET "php${PHP_VERSION}" "libapache2-mod-php${PHP_VERSION}"
 else
@@ -91,7 +105,7 @@ install_extension() {
 
   # Special-case redis (often unversioned as php-redis)
   if [ "$ext_name" = "redis" ]; then
-    if ! php -m | grep -qi '^redis$'; then
+    if ! php -m | grep -qi '^redis$' || [ "$FORCE_MODE" = true ]; then
       echo "Installing php-redis from PPA..."
       if ! apt-get install -y $APT_PPA_TARGET php-redis; then
         echo "Failed to install php-redis" >>/var/log/php-switch-error.log
@@ -103,7 +117,7 @@ install_extension() {
   fi
 
   # Normal versioned package path
-  if dpkg -l | grep -q "^ii\s\+${pkg}\s"; then
+  if [ "$FORCE_MODE" = false ] && dpkg -l | grep -q "^ii\s\+${pkg}\s"; then
     echo "✓ ${pkg} already installed"
     return 0
   fi
@@ -227,12 +241,21 @@ for phpini in "/etc/php/${PHP_VERSION}/apache2/php.ini" "/etc/php/${PHP_VERSION}
 done
 
 # Composer
-echo "Installing Composer..."
-curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
-if command -v composer >/dev/null 2>&1; then
-    echo "✓ Composer installed successfully"
+if [ "$FORCE_MODE" = true ] || ! command -v composer >/dev/null 2>&1; then
+    echo "Installing Composer..."
+    # Remove existing composer if force mode
+    if [ "$FORCE_MODE" = true ] && [ -f /usr/local/bin/composer ]; then
+        echo "Removing existing Composer (force mode)..."
+        rm -f /usr/local/bin/composer
+    fi
+    curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+    if command -v composer >/dev/null 2>&1; then
+        echo "✓ Composer installed successfully"
+    else
+        echo "⚠ Composer installation may have failed"
+    fi
 else
-    echo "⚠ Composer installation may have failed"
+    echo "✓ Composer already installed (use --force to reinstall)"
 fi
 
 # Final restart
@@ -245,6 +268,9 @@ echo "PHP SWITCH INSTALLATION REPORT"
 echo "------------------------------"
 echo "PHP Version: $(php --version | head -n1)"
 echo "Apache Module: $(apache2ctl -M 2>/dev/null | grep php || echo 'Not found')"
+if command -v composer >/dev/null 2>&1; then
+    echo "Composer Version: $(composer --version 2>/dev/null | head -n1)"
+fi
 echo
 echo "Loaded Extensions:"
 php -m | grep -E "(sqlite|pdo|mysql|redis|curl|gd|zip|json|xml)" | sort || true

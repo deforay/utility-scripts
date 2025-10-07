@@ -6,6 +6,8 @@
 # wget -O ./lamp-setup.sh https://raw.githubusercontent.com/deforay/utility-scripts/master/lamp/lamp-setup.sh
 # chmod +x ./lamp-setup.sh
 # ./lamp-setup.sh [PHP_VERSION]
+# ./lamp-setup.sh [PHP_VERSION] -f
+# ./lamp-setup.sh [PHP_VERSION] --force
 
 #=============================================================================
 # UTILITY FUNCTIONS
@@ -513,10 +515,11 @@ EOF
 
 install_php() {
     local php_version=${1:-8.2}
+    local force_flag=${2:-}
     print header "Installing and configuring PHP $php_version..."
 
-    # Download switch-php script if not already present
-    if [ ! -f "/usr/local/bin/switch-php" ]; then
+    # Download switch-php script if not already present or in force mode
+    if [ ! -f "/usr/local/bin/switch-php" ] || [ "$force_flag" = "-f" ] || [ "$force_flag" = "--force" ]; then
         print info "Downloading switch-php script..."
         wget https://raw.githubusercontent.com/deforay/utility-scripts/master/php/switch-php -O /usr/local/bin/switch-php
         chmod u+x /usr/local/bin/switch-php
@@ -524,17 +527,25 @@ install_php() {
         print info "switch-php script already exists"
     fi
 
-    # Check if the specific PHP version is already active
-    if command -v php &>/dev/null; then
-        current_version=$(php -v | head -n1 | grep -oP 'PHP \K[0-9]+\.[0-9]+')
-        if [ "$current_version" == "$php_version" ]; then
-            print info "PHP $php_version is already active"
-            return 0
+    # Check if the specific PHP version is already active and not in force mode
+    if [ "$force_flag" != "-f" ] && [ "$force_flag" != "--force" ]; then
+        if command -v php &>/dev/null; then
+            current_version=$(php -v | head -n1 | grep -oP 'PHP \K[0-9]+\.[0-9]+')
+            if [ "$current_version" == "$php_version" ]; then
+                print info "PHP $php_version is already active"
+                return 0
+            fi
         fi
     fi
 
-    print info "Switching to PHP $php_version..."
-    switch-php $php_version
+    # Run switch-php with or without force flag
+    if [ "$force_flag" = "-f" ] || [ "$force_flag" = "--force" ]; then
+        print info "Switching to PHP $php_version (force mode)..."
+        switch-php $php_version --force
+    else
+        print info "Switching to PHP $php_version..."
+        switch-php $php_version
+    fi
 }
 
 #=============================================================================
@@ -542,7 +553,16 @@ install_php() {
 #=============================================================================
 
 install_phpmyadmin() {
+    local force_flag=${1:-}
     print header "Setting up phpMyAdmin..."
+
+    # Check if force reinstall is requested
+    if [ "$force_flag" = "-f" ] || [ "$force_flag" = "--force" ]; then
+        if [ -d "/var/www/phpmyadmin" ]; then
+            print info "Force mode: Removing existing phpMyAdmin installation..."
+            rm -rf /var/www/phpmyadmin
+        fi
+    fi
 
     if [ ! -d "/var/www/phpmyadmin" ] || [ -z "$(ls -A /var/www/phpmyadmin 2>/dev/null)" ]; then
         print info "Downloading and setting up phpMyAdmin..."
@@ -563,8 +583,10 @@ install_phpmyadmin() {
         mv /var/www/phpmyadmin/$PHPMYADMIN_DIR/* /var/www/phpmyadmin/
         mv /var/www/phpmyadmin/$PHPMYADMIN_DIR/.[!.]* /var/www/phpmyadmin/ 2>/dev/null
         rmdir /var/www/phpmyadmin/$PHPMYADMIN_DIR
+        
+        print success "phpMyAdmin installed successfully"
     else
-        print info "phpMyAdmin is already installed. Skipping installation."
+        print info "phpMyAdmin is already installed. Skipping installation. (Use --force to reinstall)"
     fi
 }
 
@@ -610,11 +632,26 @@ main() {
     # Error trap
     trap 'error_handling "${BASH_COMMAND}" "$LINENO" "$?"' ERR
 
-    # Accept optional PHP version parameter, default to 8.2
+    # Parse arguments
     local PHP_VERSION=${1:-8.2}
+    local FORCE_FLAG=""
+
+    # Check for force flag in any position
+    for arg in "$@"; do
+        if [ "$arg" = "-f" ] || [ "$arg" = "--force" ]; then
+            FORCE_FLAG="--force"
+            print info "Force mode enabled: will reinstall PHP, extensions, Composer, and phpMyAdmin"
+            break
+        fi
+    done
+
+    # If force flag is present and first arg is the flag, use default PHP version
+    if [ "$1" = "-f" ] || [ "$1" = "--force" ]; then
+        PHP_VERSION="8.2"
+    fi
 
     print header "Starting LAMP Setup Script"
-    log_action "LAMP Setup started with PHP version: $PHP_VERSION"
+    log_action "LAMP Setup started with PHP version: $PHP_VERSION (Force: ${FORCE_FLAG:-no})"
 
     # Phase 1: Validation
     check_root_privileges
@@ -639,10 +676,10 @@ main() {
     secure_mysql
 
     # Phase 5: PHP Setup
-    install_php $PHP_VERSION
+    install_php $PHP_VERSION $FORCE_FLAG
 
     # Phase 6: phpMyAdmin Setup
-    install_phpmyadmin
+    install_phpmyadmin $FORCE_FLAG
     configure_phpmyadmin_apache
 
     # Final restart and completion
