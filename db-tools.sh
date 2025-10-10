@@ -3,7 +3,7 @@
 # Features: backups, PITR, encryption, notifications, health checks, GFS rotation
 #
 # Install:
-#   sudo wget -O /usr/local/bin/db-tools <your-url>
+#   sudo wget -O /usr/local/bin/db-tools https://raw.githubusercontent.com/deforay/utility-scripts/master/db-tools.sh
 #   sudo chmod +x /usr/local/bin/db-tools
 #
 # Usage:
@@ -1247,8 +1247,6 @@ cleanup() {
   log INFO "✅ Cleanup complete"
   add_summary "Cleanup: $deleted_count file(s) removed (retention: $days days, keep_min: $CLEAN_KEEP_MIN)"
 }
-
-
 
 
 # ========================== List Backups ==========================
