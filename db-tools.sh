@@ -561,42 +561,66 @@ OPTS
         fi
     }
     
-    # Execute dumps
+        # Execute dumps
     local errors=0
     local completed=0
 
     if (( PARALLEL_JOBS > 1 )); then
         log INFO "Using $PARALLEL_JOBS parallel jobs"
-        local -a pids=()
-        local -a names=()
 
-        # launch with throttle by queue length
-        for db in "${DBS[@]}"; do
-            dump_one "$db" & pids+=("$!"); names+=("$db")
+        # --- portable semaphore via FIFO (no wait -n needed) ---
+        local fifo
+        fifo="$(mktemp -u)"
+        mkfifo "$fifo"
+        # FD 3 will be our token stream
+        exec 3<>"$fifo"
+        rm -f "$fifo"   # fifo persists via FD
 
-            # If we hit the concurrency limit, wait for the oldest PID
-            if (( ${#pids[@]} >= PARALLEL_JOBS  )); then
-                if wait "${pids[0]}"; then
-                    ((completed++))
-                else
-                    ((errors++))
-                fi
-                # pop front
-                pids=("${pids[@]:1}")
-                names=("${names[@]:1}")
-                show_progress "$completed" "${#DBS[@]}" "Backup"
-            fi
+        # seed tokens
+        for _ in $(seq 1 "$PARALLEL_JOBS"); do
+          printf '.' >&3
         done
 
-        # wait remaining
-        for pid in "${pids[@]}"; do
-            if wait "$pid"; then
-                ((completed++))
+        # ensure FD is closed at the end so the final read unblocks
+        stack_trap 'exec 3>&- 3<&- || true' EXIT
+
+        for db in "${DBS[@]}"; do
+          # acquire a token (blocks if pool is empty)
+          read -r -u 3 _
+
+          {
+            # run one dump
+            if dump_one "$db"; then
+              exit 0
             else
-                ((errors++))
+              exit 1
+            fi
+          } &
+          
+          # watcher that waits for the job above and updates counters, then returns token
+          {
+            pid=$!
+            if wait "$pid"; then
+              ((completed++))
+            else
+              ((errors++))
             fi
             show_progress "$completed" "${#DBS[@]}" "Backup"
+            # return the token
+            printf '.' >&3
+          } &
         done
+
+        # Drain: take all tokens back so we know all jobs finished.
+        # (We seeded PARALLEL_JOBS tokens; after all jobs complete,
+        # the same number will be written back.)
+        for _ in $(seq 1 "$PARALLEL_JOBS"); do
+          read -r -u 3 _
+        done
+
+        # close semaphore FD (also done by trap)
+        exec 3>&- 3<&- || true
+
     else
         for db in "${DBS[@]}"; do
             if dump_one "$db"; then
@@ -608,17 +632,16 @@ OPTS
         done
     fi
 
-    
     # Copy binlog index
     [[ -r /var/lib/mysql/binlog.index ]] && cp -f /var/lib/mysql/binlog.index "$BACKUP_DIR/binlog-index-$ts.txt" || true
-    
+
     if (( errors > 0 )); then
         warn "Backup completed with $errors error(s)"
         add_summary "Full backup: $completed OK, $errors failed"
         notify "Backup completed with errors" "Completed: $completed, Failed: $errors" "error"
         return 1
     fi
-    
+
     log INFO "✅ Full backup complete: $completed databases"
     add_summary "Full backup: $completed databases backed up successfully"
     notify "Backup completed successfully" "Backed up $completed databases" "info"
