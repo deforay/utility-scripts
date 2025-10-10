@@ -73,6 +73,69 @@ declare -g OPERATION_START=$(date +%s)
 
 # ========================== Utility Functions ==========================
 
+# ---------- TTY helpers (visual cues) ----------
+is_tty() { [[ -t 2 ]] && [[ "${NO_TTY:-0}" != "1" ]]; }
+
+SPINNER_PID=""
+start_spinner() {
+  is_tty || return 0
+  local msg="${*:-Working}"
+  # minimal spinner on STDERR so normal output stays clean
+  (
+    local frames='|/-\'
+    local i=0
+    # hide cursor
+    printf '\033[?25l' >&2
+    while :; do
+      printf '\r%s %s' "$msg" "${frames:i++%4:1}" >&2
+      sleep 0.15
+    done
+  ) &
+  SPINNER_PID=$!
+  # make sure it stops even on errors
+  stack_trap 'stop_spinner' EXIT
+}
+
+stop_spinner() {
+  [[ -n "$SPINNER_PID" ]] || return 0
+  kill "$SPINNER_PID" >/dev/null 2>&1 || true
+  wait "$SPINNER_PID" 2>/dev/null || true
+  SPINNER_PID=""
+  # clear spinner line & show cursor
+  printf '\r\033[K\033[?25h' >&2
+}
+
+# prettier progress bar (still cheap)
+show_progress() {
+  local current="$1"
+  local total="$2"
+  local desc="${3:-Progress}"
+  local width=42
+  [[ "$total" -eq 0 ]] && return
+
+  local pct=$(( current * 100 / total ))
+  local filled=$(( width * current / total ))
+  local empty=$(( width - filled ))
+
+  # ▓ bar if TTY; plain if not
+  if is_tty; then
+    printf '\r%s: [%*s%*s] %3d%% (%d/%d)' \
+      "$desc" \
+      "$filled" '' \
+      "$empty" '' \
+      "$pct" "$current" "$total" >&2
+    # replace spaces in the filled section with █
+    printf '\e[%dD' $(( 1 + 1 + 1 + empty + 6 + ${#desc} + 4 )) >&2
+    printf '\e[%dC' $(( ${#desc} + 3 )) >&2
+    printf '%*s' "$filled" '' | tr ' ' '█' >&2
+  else
+    printf '%s: %d/%d (%d%%)\n' "$desc" "$current" "$total" "$pct" >&2
+  fi
+
+  [[ "$current" -eq "$total" ]] && { is_tty && echo >&2; }
+}
+
+
 log() {
     local level="${1:-INFO}"
     shift
@@ -567,6 +630,8 @@ OPTS
 
     if (( PARALLEL_JOBS > 1 )); then
         log INFO "Using $PARALLEL_JOBS parallel jobs"
+        start_spinner "Running backups"
+
 
         # --- portable semaphore via FIFO (no wait -n needed) ---
         local fifo
@@ -620,7 +685,7 @@ OPTS
 
         # close semaphore FD (also done by trap)
         exec 3>&- 3<&- || true
-
+        stop_spinner
     else
         for db in "${DBS[@]}"; do
             if dump_one "$db"; then
@@ -721,6 +786,8 @@ verify() {
     local ok=0 bad=0 warn_count=0
     local idx=0
     
+    start_spinner "Verifying backups"
+
     for f in "${files[@]}"; do
         ((idx++))
         show_progress "$idx" "${#files[@]}" "Verify"
@@ -764,7 +831,7 @@ verify() {
             fi
         fi
     done
-    
+    stop_spinner
     log INFO "Verify complete: OK=$ok, Corrupt=$bad, Warnings=$warn_count"
     add_summary "Verification: $ok OK, $bad corrupt, $warn_count warnings"
     
