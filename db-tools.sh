@@ -564,33 +564,37 @@ OPTS
     # Execute dumps
     local errors=0
     local completed=0
-    
+
     if (( PARALLEL_JOBS > 1 )); then
         log INFO "Using $PARALLEL_JOBS parallel jobs"
-        local running=0
-        
+        local -a pids=()
+        local -a names=()
+
+        # launch with throttle by queue length
         for db in "${DBS[@]}"; do
-            dump_one "$db" &
-            ((running++))
-            
-            if (( running >= PARALLEL_JOBS )); then
-                if wait -n; then
+            dump_one "$db" & pids+=("$!"); names+=("$db")
+
+            # If we hit the concurrency limit, wait for the oldest PID
+            if (( ${#pids[@]} >= PARALLEL_JOBS  )); then
+                if wait "${pids[0]}"; then
                     ((completed++))
                 else
                     ((errors++))
                 fi
-                ((running--))
+                # pop front
+                pids=("${pids[@]:1}")
+                names=("${names[@]:1}")
                 show_progress "$completed" "${#DBS[@]}" "Backup"
             fi
         done
-        
-        while (( running > 0 )); do
-            if wait -n; then
+
+        # wait remaining
+        for pid in "${pids[@]}"; do
+            if wait "$pid"; then
                 ((completed++))
             else
                 ((errors++))
             fi
-            ((running--))
             show_progress "$completed" "${#DBS[@]}" "Backup"
         done
     else
@@ -603,6 +607,7 @@ OPTS
             show_progress "$completed" "${#DBS[@]}" "Backup"
         done
     fi
+
     
     # Copy binlog index
     [[ -r /var/lib/mysql/binlog.index ]] && cp -f /var/lib/mysql/binlog.index "$BACKUP_DIR/binlog-index-$ts.txt" || true
