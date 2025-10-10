@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# db-tools.sh — Enhanced MySQL/MariaDB admin toolkit
+# db-tools.sh — MySQL/MariaDB admin toolkit
 # Features: backups, PITR, encryption, notifications, health checks, GFS rotation
 #
 # Install:
@@ -105,34 +105,37 @@ stop_spinner() {
   printf '\r\033[K\033[?25h' >&2
 }
 
-# prettier progress bar (still cheap)
 show_progress() {
-  local current="$1"
-  local total="$2"
-  local desc="${3:-Progress}"
-  local width=42
-  [[ "$total" -eq 0 ]] && return
+    local current="$1"
+    local total="$2"
+    local desc="${3:-Progress}"
+    local width=42
+    
+    [[ "$total" -eq 0 ]] && return
+    
+    # Cap current at total to prevent overflow
+    [[ "$current" -gt "$total" ]] && current="$total"
+    
+    local pct=$(( current * 100 / total ))
+    local filled=$(( width * current / total ))
+    local empty=$(( width - filled ))
 
-  local pct=$(( current * 100 / total ))
-  local filled=$(( width * current / total ))
-  local empty=$(( width - filled ))
+    # ▓ bar if TTY; plain if not
+    if is_tty; then
+        printf '\r%s: [%*s%*s] %3d%% (%d/%d)' \
+          "$desc" \
+          "$filled" '' \
+          "$empty" '' \
+          "$pct" "$current" "$total" >&2
+        # replace spaces in the filled section with █
+        printf '\e[%dD' $(( 1 + 1 + 1 + empty + 6 + ${#desc} + 4 )) >&2
+        printf '\e[%dC' $(( ${#desc} + 3 )) >&2
+        printf '%*s' "$filled" '' | tr ' ' '█' >&2
+    else
+        printf '%s: %d/%d (%d%%)\n' "$desc" "$current" "$total" "$pct" >&2
+    fi
 
-  # ▓ bar if TTY; plain if not
-  if is_tty; then
-    printf '\r%s: [%*s%*s] %3d%% (%d/%d)' \
-      "$desc" \
-      "$filled" '' \
-      "$empty" '' \
-      "$pct" "$current" "$total" >&2
-    # replace spaces in the filled section with █
-    printf '\e[%dD' $(( 1 + 1 + 1 + empty + 6 + ${#desc} + 4 )) >&2
-    printf '\e[%dC' $(( ${#desc} + 3 )) >&2
-    printf '%*s' "$filled" '' | tr ' ' '█' >&2
-  else
-    printf '%s: %d/%d (%d%%)\n' "$desc" "$current" "$total" "$pct" >&2
-  fi
-
-  [[ "$current" -eq "$total" ]] && { is_tty && echo >&2; }
+    [[ "$current" -eq "$total" ]] && { is_tty && echo >&2; }
 }
 
 
@@ -174,6 +177,50 @@ print_summary() {
     local duration=$(( $(date +%s) - OPERATION_START ))
     log INFO "=== Operation Summary (${duration}s) ==="
     printf '%s\n' "${BACKUP_SUMMARY[@]}" >&2
+}
+
+generate_encryption_key() {
+    local key_file="${1:-$ENCRYPTION_KEY_FILE}"
+    
+    if [[ -z "$key_file" ]]; then
+        err "No encryption key file specified. Set ENCRYPTION_KEY_FILE or provide path as argument."
+    fi
+    
+    if [[ -f "$key_file" ]]; then
+        read -r -p "Key file exists at $key_file. Overwrite? [y/N]: " confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || { log INFO "Cancelled"; return 0; }
+    fi
+    
+    local key_dir
+    key_dir="$(dirname "$key_file")"
+    mkdir -p "$key_dir" || err "Cannot create directory: $key_dir"
+    
+    log INFO "Generating 256-bit encryption key..."
+    
+    # Generate a strong random key
+    if have openssl; then
+        openssl rand -base64 32 > "$key_file"
+    elif have /dev/urandom; then
+        head -c 32 /dev/urandom | base64 > "$key_file"
+    else
+        err "Cannot generate random key: neither openssl nor /dev/urandom available"
+    fi
+    
+    # Set secure permissions
+    chmod 600 "$key_file"
+    
+    # Try to set immutable flag if possible (Linux only)
+    if have chattr; then
+        chattr +i "$key_file" 2>/dev/null && log INFO "Set immutable flag on key file" || true
+    fi
+    
+    log INFO "✅ Encryption key created: $key_file"
+    log INFO "⚠️  IMPORTANT: Back up this key file securely!"
+    log INFO "⚠️  Without this key, encrypted backups cannot be restored."
+    echo
+    log INFO "To enable encryption, set in your config:"
+    echo "  ENCRYPT_BACKUPS=1"
+    echo "  ENCRYPTION_KEY_FILE=\"$key_file\""
 }
 
 trap print_summary EXIT
@@ -272,13 +319,30 @@ stack_trap() {
 }
 
 check_key_perms() {
-  [[ "$ENCRYPT_BACKUPS" == "1" && -n "$ENCRYPTION_KEY_FILE" && -f "$ENCRYPTION_KEY_FILE" ]] || return 0
-  # Require owner read/write only (0600-ish). On non-GNU stat this just won't run; we silently continue.
+  [[ "$ENCRYPT_BACKUPS" == "1" && -n "$ENCRYPTION_KEY_FILE" ]] || return 0
+  
+  [[ -f "$ENCRYPTION_KEY_FILE" ]] || err "Encryption key file not found: $ENCRYPTION_KEY_FILE"
+  
+  # Check permissions - must be 600 or 400
   if perms=$(stat -c '%a' "$ENCRYPTION_KEY_FILE" 2>/dev/null); then
     if (( perms > 600 )); then
-      warn "Encryption key file $ENCRYPTION_KEY_FILE permissions are $perms (should be 600)."
+      err "SECURITY: Encryption key permissions are $perms (must be 600 or stricter). Fix with: chmod 600 $ENCRYPTION_KEY_FILE"
+    fi
+  elif perms=$(stat -f '%Lp' "$ENCRYPTION_KEY_FILE" 2>/dev/null); then
+    # BSD stat fallback
+    if (( perms > 600 )); then
+      err "SECURITY: Encryption key permissions are $perms (must be 600 or stricter). Fix with: chmod 600 $ENCRYPTION_KEY_FILE"
     fi
   fi
+  
+  # Check ownership (should be current user or root)
+  if owner=$(stat -c '%U' "$ENCRYPTION_KEY_FILE" 2>/dev/null); then
+    if [[ "$owner" != "$USER" && "$owner" != "root" && "$EUID" -ne 0 ]]; then
+      warn "Encryption key owned by $owner (expected $USER or root)"
+    fi
+  fi
+  
+  debug "Encryption key permissions validated"
 }
 
 
@@ -463,26 +527,6 @@ estimate_backup_size() {
 
 # ========================== Progress Functions ==========================
 
-show_progress() {
-    local current="$1"
-    local total="$2"
-    local desc="${3:-Progress}"
-    local width=50
-    
-    [[ "$total" -eq 0 ]] && return
-    
-    local percentage=$((current * 100 / total))
-    local completed=$((width * current / total))
-    
-    printf '\r%s: [%s%s] %d%% (%d/%d)' \
-        "$desc" \
-        "$(printf '%*s' "$completed" '' | tr ' ' '=')" \
-        "$(printf '%*s' $((width - completed)) '')" \
-        "$percentage" "$current" "$total" >&2
-    
-    [[ "$current" -eq "$total" ]] && echo >&2
-}
-
 # ========================== Initialization ==========================
 
 init() {
@@ -604,7 +648,7 @@ backup_full() {
 --column-statistics=0
 OPTS
     
-    # Dump function
+    # Dump function with validation
     dump_one() {
         local db="$1"
         local out="$BACKUP_DIR/${db}-${ts}.${ext}"
@@ -615,6 +659,21 @@ OPTS
             mv "$tmp" "$out"
             rm -f "${out}.err"
             create_checksum "$out"
+            
+            # Quick validation - check if backup is readable and contains MySQL dump header
+            local decomp_cmd="$(decompressor "$out")"
+            if [[ "$ENCRYPT_BACKUPS" == "1" ]]; then
+                if ! decrypt_if_encrypted "$out" < "$out" | $decomp_cmd | head -n 50 | grep -q "^-- MySQL dump" 2>/dev/null; then
+                    warn "Backup validation failed: $db"
+                    return 1
+                fi
+            else
+                if ! $decomp_cmd < "$out" | head -n 50 | grep -q "^-- MySQL dump" 2>/dev/null; then
+                    warn "Backup validation failed: $db"
+                    return 1
+                fi
+            fi
+            
             log INFO "✅ $db → $(basename "$out")"
             return 0
         else
@@ -624,14 +683,16 @@ OPTS
         fi
     }
     
-        # Execute dumps
+    # Execute dumps
     local errors=0
     local completed=0
+    local status_dir="$BACKUP_DIR/.job_status.$$"
+    mkdir -p "$status_dir"
+    stack_trap "rm -rf '$status_dir'" EXIT
 
     if (( PARALLEL_JOBS > 1 )); then
         log INFO "Using $PARALLEL_JOBS parallel jobs"
         start_spinner "Running backups"
-
 
         # --- portable semaphore via FIFO (no wait -n needed) ---
         local fifo
@@ -649,36 +710,32 @@ OPTS
         # ensure FD is closed at the end so the final read unblocks
         stack_trap 'exec 3>&- 3<&- || true' EXIT
 
+        local job_num=0
         for db in "${DBS[@]}"; do
           # acquire a token (blocks if pool is empty)
           read -r -u 3 _
+          ((job_num++))
 
           {
             # run one dump
+            local status_file="$status_dir/job_${job_num}.status"
             if dump_one "$db"; then
-              exit 0
+              echo "ok" > "$status_file"
             else
-              exit 1
+              echo "error" > "$status_file"
             fi
           } &
           
-          # watcher that waits for the job above and updates counters, then returns token
+          # watcher that waits for the job above and returns token
           {
-            pid=$!
-            if wait "$pid"; then
-              ((completed++))
-            else
-              ((errors++))
-            fi
-            show_progress "$completed" "${#DBS[@]}" "Backup"
+            local pid=$!
+            wait "$pid" 2>/dev/null || true
             # return the token
             printf '.' >&3
           } &
         done
 
         # Drain: take all tokens back so we know all jobs finished.
-        # (We seeded PARALLEL_JOBS tokens; after all jobs complete,
-        # the same number will be written back.)
         for _ in $(seq 1 "$PARALLEL_JOBS"); do
           read -r -u 3 _
         done
@@ -686,6 +743,19 @@ OPTS
         # close semaphore FD (also done by trap)
         exec 3>&- 3<&- || true
         stop_spinner
+        
+        # Count results from status files
+        for sf in "$status_dir"/job_*.status; do
+            [[ -f "$sf" ]] || continue
+            if grep -q "ok" "$sf" 2>/dev/null; then
+                ((completed++))
+            else
+                ((errors++))
+            fi
+        done
+        
+        # Show final progress
+        show_progress "$completed" "${#DBS[@]}" "Backup"
     else
         for db in "${DBS[@]}"; do
             if dump_one "$db"; then
@@ -794,8 +864,8 @@ verify() {
         
         local base="$(basename "$f")"
         
-        # Skip checksum files
-        [[ "$base" =~ \.sha256$ ]] && continue
+        # Skip checksum and metadata files
+        [[ "$base" =~ \.(sha256|meta)$ ]] && continue
         
         # Verify checksum first
         if ! verify_checksum "$f"; then
@@ -805,21 +875,20 @@ verify() {
         # Verify compression/encryption integrity
         local decomp_cmd="$(decompressor "$f")"
         if [[ "$f" =~ \.enc$ ]]; then
-          # decrypt → decompress to /dev/null
+          # decrypt → decompress to /dev/null (use stdin, not filename)
           if decrypt_if_encrypted "$f" < "$f" | $decomp_cmd > /dev/null 2>&1; then
             ((ok++)); debug "OK(enc): $base"
           else
             ((bad++)); warn "CORRUPT (enc): $base"; continue
           fi
         else
-          # direct decompress to /dev/null
-          if $decomp_cmd "$f" > /dev/null 2>&1; then
+          # direct decompress to /dev/null (use stdin, not filename)
+          if $decomp_cmd < "$f" > /dev/null 2>&1; then
             ((ok++)); debug "OK: $base"
           else
             ((bad++)); warn "CORRUPT: $base"; continue
           fi
         fi
-
         
         # Check for metadata
         local ts="$(dump_ts_from_name "$base")"
@@ -831,13 +900,14 @@ verify() {
             fi
         fi
     done
+    
     stop_spinner
     log INFO "Verify complete: OK=$ok, Corrupt=$bad, Warnings=$warn_count"
     add_summary "Verification: $ok OK, $bad corrupt, $warn_count warnings"
     
     if (( bad > 0 )); then
         notify "Backup verification failed" "$bad corrupt file(s) found" "error"
-        exit 1
+        return 1
     fi
     
     [[ "$ok" -gt 0 ]] && notify "Backup verification passed" "$ok file(s) verified successfully" "info"
@@ -854,6 +924,22 @@ restore() {
     local until_time="${UNTIL_TIME:-}"
     local end_pos="${END_POS:-}"
     
+    # Validate datetime format if provided
+    if [[ -n "$until_time" ]]; then
+        if ! date -d "$until_time" >/dev/null 2>&1; then
+            err "Invalid UNTIL_TIME format: '$until_time' (expected: YYYY-MM-DD HH:MM:SS)"
+        fi
+        log INFO "PITR target time: $until_time"
+    fi
+    
+    # Validate end position if provided
+    if [[ -n "$end_pos" ]]; then
+        if ! [[ "$end_pos" =~ ^[0-9]+$ ]]; then
+            err "Invalid END_POS: '$end_pos' (must be a positive integer)"
+        fi
+        log INFO "PITR end position: $end_pos"
+    fi
+    
     if [[ -z "$arg1" ]]; then
         cat <<EOF
 Usage:
@@ -861,11 +947,27 @@ Usage:
   $0 restore /path/to/backup.sql.gz [target-db]
   
 Optional PITR environment variables:
-  UNTIL_TIME='YYYY-MM-DD HH:MM:SS'
-  END_POS=<position>
+  UNTIL_TIME='YYYY-MM-DD HH:MM:SS'  - Replay binlogs until this timestamp
+  END_POS=<position>                - Stop at this binlog position
   
-Example:
+Examples:
+  # Basic restore
+  $0 restore mydb
+  
+  # Restore all databases
+  $0 restore ALL
+  
+  # Point-in-time restore
   UNTIL_TIME='2025-01-15 10:30:00' $0 restore mydb
+  
+  # Restore from specific file
+  $0 restore /var/backups/mysql/mydb-2025-01-15-10-00-00.sql.gz
+  
+  # Restore with rename
+  $0 restore /path/to/prod-backup.sql.gz test_database
+  
+  # Drop and recreate before restore
+  DROP_FIRST=1 $0 restore mydb
 EOF
         exit 1
     fi
@@ -896,7 +998,7 @@ restore_file() {
       decrypt_if_encrypted "$file" < "$file" | $decomp_cmd >/dev/null 2>&1 \
         || err "Backup file appears corrupt (enc): $file"
     else
-      $decomp_cmd "$file" >/dev/null 2>&1 \
+      $decomp_cmd < "$file" >/dev/null 2>&1 \
         || err "Backup file appears corrupt: $file"
     fi
     
@@ -921,10 +1023,16 @@ restore_file() {
         decrypt_if_encrypted "$file" < "$file" | $decomp_cmd | "$MYSQL" --login-path="$LOGIN_PATH"
     else
         warn "Renaming database on restore: $src_db → $dest_db"
+        
+        # Escape special regex characters in database names
+        local src_escaped dest_escaped
+        src_escaped=$(printf '%s\n' "$src_db" | sed 's/[.[\*^$]/\\&/g')
+        dest_escaped=$(printf '%s\n' "$dest_db" | sed 's/[&/\]/\\&/g')
+        
         decrypt_if_encrypted "$file" < "$file" | $decomp_cmd \
             | sed -E \
-                -e "s/^(CREATE[[:space:]]+DATABASE([[:space:]]+\/\*![0-9]+\*\/)?[[:space:]]+(IF[[:space:]]+NOT[[:space:]]+EXISTS[[:space:]]+)?)(\`?)${src_db}(\`?)([^;]*;)/\1\`${dest_db}\`\6/I" \
-                -e "s/^USE[[:space:]]+\`?${src_db}\`?/USE \`${dest_db}\`/I" \
+                -e "s/^(CREATE DATABASE[^;]*\`)${src_escaped}(\`)/\1${dest_escaped}\2/g" \
+                -e "s/^USE \`${src_escaped}\`/USE \`${dest_escaped}\`/g" \
             | "$MYSQL" --login-path="$LOGIN_PATH"
     fi
     
@@ -986,6 +1094,13 @@ run_pitr_local() {
     
     [[ -z "$MYSQLBINLOG" ]] && { warn "mysqlbinlog not available, skipping PITR"; return 0; }
     
+    # Validate datetime format if provided
+    if [[ -n "$until_time" ]]; then
+        if ! date -d "$until_time" >/dev/null 2>&1; then
+            err "Invalid UNTIL_TIME format: $until_time (expected: YYYY-MM-DD HH:MM:SS)"
+        fi
+    fi
+    
     local meta
     if [[ -n "$dump_ts" && -f "$BACKUP_DIR/backup-$dump_ts.meta" ]]; then
         meta="$BACKUP_DIR/backup-$dump_ts.meta"
@@ -1042,17 +1157,58 @@ run_pitr_local() {
     [[ -n "$end_pos" ]] && log INFO "End position: $end_pos"
     
     local last_idx=$(( ${#files[@]} - 1 ))
+    local stopped_early=0
+    
     for i in $(seq "$start_idx" "$last_idx"); do
         local cmd=("$MYSQLBINLOG")
         [[ -n "$db_filter" ]] && cmd+=("--database=$db_filter")
         
-        if [[ "$i" -eq "$last_idx" ]]; then
-            [[ -n "$until_time" ]] && cmd+=("--stop-datetime=$until_time")
-            [[ -n "$end_pos" ]] && cmd+=("--stop-position=$end_pos")
+        # Apply start position only for the first file
+        if [[ "$i" -eq "$start_idx" && -n "${binlog_pos:-}" ]]; then
+            cmd+=("--start-position=${binlog_pos}")
+        fi
+        
+        # Always apply stop criteria - mysqlbinlog will stop when reached
+        [[ -n "$until_time" ]] && cmd+=("--stop-datetime=$until_time")
+        
+        # Stop position only applies to the last binlog file
+        if [[ "$i" -eq "$last_idx" && -n "$end_pos" ]]; then
+            cmd+=("--stop-position=$end_pos")
         fi
         
         cmd+=("${files[$i]}")
-        "${cmd[@]}" | "$MYSQL" --login-path="$LOGIN_PATH"
+        
+        log INFO "Processing binlog: $(basename "${files[$i]}")"
+        
+        if ! "${cmd[@]}" | "$MYSQL" --login-path="$LOGIN_PATH"; then
+            # Check if this is expected (reached target time)
+            if [[ -n "$until_time" ]]; then
+                debug "Binlog replay stopped (likely reached target time)"
+                stopped_early=1
+                break
+            else
+                warn "Binlog replay error for ${files[$i]}"
+            fi
+        fi
+        
+        # If we have a stop-datetime, check if we should continue
+        # (mysqlbinlog may have stopped when it reached the target time)
+        if [[ -n "$until_time" && "$i" -lt "$last_idx" ]]; then
+            # Check if the next binlog file's first timestamp is after our target
+            local next_file="${files[$((i+1))]}"
+            if [[ -f "$next_file" ]]; then
+                local first_ts
+                first_ts=$("$MYSQLBINLOG" --start-position=4 "$next_file" 2>/dev/null | grep -m1 "^#[0-9]" | awk '{print $1 " " $2}' | sed 's/#//' || true)
+                if [[ -n "$first_ts" ]]; then
+                    # Compare timestamps (basic check)
+                    if [[ "$first_ts" > "$until_time" ]]; then
+                        log INFO "Next binlog starts after target time, stopping"
+                        stopped_early=1
+                        break
+                    fi
+                fi
+            fi
+        fi
     done
     
     log INFO "✅ PITR replay complete"
@@ -1108,17 +1264,24 @@ health() {
         ((status++))
     fi
     
-    # Disk space
-    local available=$(df -BG "$BACKUP_DIR" 2>/dev/null | awk 'NR==2 {print $4}' | sed 's/G//' || echo "0")
-    if (( available > 10 )); then
-        echo "✅ Disk Space: ${available}GB available"
+    # Disk space - use MB for precision
+    local available_mb
+    available_mb=$(df -BM "$BACKUP_DIR" 2>/dev/null | awk 'NR==2 {print $4}' | sed 's/M//' || echo "0")
+    local available_gb=$((available_mb / 1024))
+    
+    if (( available_gb > 10 )); then
+        echo "✅ Disk Space: ${available_gb}GB available (${available_mb}MB)"
+    elif (( available_gb > 5 )); then
+        echo "⚠️  Disk Space: ${available_gb}GB available (getting low)"
+        ((status++))
     else
-        echo "⚠️  Disk Space: ${available}GB available (low!)"
+        echo "❌ Disk Space: ${available_gb}GB available (critically low!)"
         ((status++))
     fi
     
     # Last backup
-    local last_backup=$(find "$BACKUP_DIR" -name "*.sql.*" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2- || true)
+    local last_backup
+    last_backup=$(find "$BACKUP_DIR" -name "*.sql.*" -type f ! -name "*.sha256" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2- || true)
     if [[ -n "$last_backup" ]]; then
         local age=$(( ($(date +%s) - $(stat -c %Y "$last_backup" 2>/dev/null || echo 0)) / 3600 ))
         if (( age < 48 )); then
@@ -1133,7 +1296,8 @@ health() {
     fi
     
     # Binary logging
-    local binlog_status=$("$MYSQL" --login-path="$LOGIN_PATH" -N -e "SHOW VARIABLES LIKE 'log_bin';" 2>/dev/null | awk '{print $2}' || echo "OFF")
+    local binlog_status
+    binlog_status=$("$MYSQL" --login-path="$LOGIN_PATH" -N -e "SHOW VARIABLES LIKE 'log_bin';" 2>/dev/null | awk '{print $2}' || echo "OFF")
     if [[ "$binlog_status" == "ON" ]]; then
         echo "✅ Binary Logging: Enabled (PITR available)"
     else
@@ -1142,7 +1306,7 @@ health() {
     
     # Compression tool
     if have pigz || have zstd; then
-        echo "✅ Compression: Parallel compression available"
+        echo "✅ Compression: Parallel compression available ($COMPRESS_ALGO)"
     else
         echo "⚠️  Compression: Using gzip (slower)"
     fi
@@ -1157,6 +1321,7 @@ health() {
     # Encryption
     if [[ "$ENCRYPT_BACKUPS" == "1" ]] && [[ -f "$ENCRYPTION_KEY_FILE" ]]; then
         echo "✅ Encryption: Enabled"
+        check_key_perms || ((status++))
     else
         echo "ℹ️  Encryption: Disabled"
     fi
@@ -1265,20 +1430,21 @@ cleanup() {
   local f base db
   for f in "$BACKUP_DIR"/*-*.sql.*; do
     [[ -f "$f" ]] || continue
-    [[ "$f" =~ \.sha256$ ]] && continue
+    [[ "$f" =~ \.(sha256|meta)$ ]] && continue
     base="$(basename "$f")"
     db="${base%%-[0-9][0-9][0-9][0-9]-*}"
     bydb["$db"]+="$f"$'\n'
   done
 
-  local files keep_count
+  local -a files
+  local keep_count
   for db in "${!bydb[@]}"; do
-    # Newest first by mtime
-    # shellcheck disable=SC2206
-    files=( $(printf "%s" "${bydb[$db]}" \
-              | sed '/^$/d' \
-              | xargs -I{} stat -c "%Y:{}" {} 2>/dev/null \
-              | sort -nr | cut -d: -f2-) )
+    # Build array of files sorted by modification time (newest first)
+    files=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && files+=("$line")
+    done < <(printf "%s" "${bydb[$db]}" | sed '/^$/d' | xargs -d '\n' -I{} stat -c "%Y {}" {} 2>/dev/null | sort -rn | cut -d' ' -f2-)
+    
     keep_count=0
     for f in "${files[@]}"; do
       if (( keep_count < CLEAN_KEEP_MIN )); then
@@ -1286,7 +1452,7 @@ cleanup() {
         debug "Keeping (min): $(basename "$f")"
         continue
       fi
-      # Use -print -quit trick so the 'if' only succeeds when the file is older than $days
+      # Check if file is older than retention period
       if [[ -n "$(find "$f" -mtime +"$days" -print -quit 2>/dev/null)" ]]; then
         if (( DRY_RUN == 1 )); then
           log INFO "DRY-RUN: Would delete $(basename "$f")"
@@ -1321,9 +1487,11 @@ cleanup() {
     if ! compgen -G "$BACKUP_DIR/*-$ts.sql.*" >/dev/null 2>&1; then
       if (( DRY_RUN == 1 )); then
         log INFO "DRY-RUN: Would delete orphan meta $(basename "$m")"
+        ((deleted_count++))
       else
         log INFO "Deleting orphan meta: $(basename "$m")"
         rm -f "$m"
+        ((deleted_count++))
       fi
     fi
   done
@@ -1333,9 +1501,11 @@ cleanup() {
   while IFS= read -r idxf; do
     if (( DRY_RUN == 1 )); then
       log INFO "DRY-RUN: Would delete $(basename "$idxf")"
+      ((deleted_count++))
     else
       log INFO "Deleting: $(basename "$idxf")"
       rm -f "$idxf"
+      ((deleted_count++))
     fi
   done < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name "binlog-index-*.txt" -mtime +"$days" -print 2>/dev/null)
 
@@ -1433,7 +1603,7 @@ EOF
 
 usage() {
     cat <<EOF
-db-tools - Enhanced MySQL/MariaDB Administration Toolkit
+db-tools - MySQL/MariaDB Administration Toolkit
 
 Usage: $0 <command> [options]
 
@@ -1452,6 +1622,7 @@ Commands:
   cleanup [days]                Remove old backups (default: RETENTION_DAYS)
   
   config [path]                 Generate sample configuration file
+  genkey [path]                 Generate encryption key file
   help                          Show this help message
 
 Environment Variables:
@@ -1500,7 +1671,7 @@ Configuration:
 Documentation:
   For more information, visit: https://github.com/deforay/utility-scripts
 
-Version: 2.0.0-enhanced
+Version: 3.0.0
 EOF
 }
 
@@ -1549,6 +1720,9 @@ case "$cmd" in
         ;;
     config)
         generate_config "${1:-$CONFIG_FILE}"
+        ;;
+    genkey|generate-key)
+        generate_encryption_key "${1:-$ENCRYPTION_KEY_FILE}"
         ;;
     help|-h|--help|"")
         usage
