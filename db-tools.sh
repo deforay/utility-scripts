@@ -22,6 +22,7 @@ set -euo pipefail
 # ========================== Configuration ==========================
 CONFIG_FILE="${CONFIG_FILE:-/etc/db-tools.conf}"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/mysql}"
+LOG_DIR="${LOG_DIR:-/var/log/db-tools}"
 RETENTION_DAYS="${RETENTION_DAYS:-7}"
 LOGIN_PATH="${LOGIN_PATH:-dbtools}"
 PARALLEL_JOBS="${PARALLEL_JOBS:-2}"
@@ -53,6 +54,9 @@ NOTIFY_EMAIL="${NOTIFY_EMAIL:-}"
 NOTIFY_WEBHOOK="${NOTIFY_WEBHOOK:-}"
 NOTIFY_ON="${NOTIFY_ON:-error}"  # always, error, never
 
+# Auto-install behavior
+AUTO_INSTALL="${AUTO_INSTALL:-0}"  # Set to 1 to enable auto-installation of tools
+
 # Logging
 LOG_LEVEL="${LOG_LEVEL:-INFO}"  # DEBUG, INFO, WARN, ERROR
 USE_SYSLOG="${USE_SYSLOG:-0}"
@@ -79,6 +83,125 @@ XTRABACKUP="${XTRABACKUP:-$(command -v xtrabackup || command -v mariabackup || t
 # Global state
 declare -g BACKUP_SUMMARY=()
 declare -g OPERATION_START=$(date +%s)
+
+
+# ===== Auto-safe heuristics (configurable via env) =====
+# Minimum free space (GB) on /var/lib/mysql to allow OPTIMIZE
+SAFE_MIN_FREE_GB="${SAFE_MIN_FREE_GB:-10}"
+# Free space must also be >= RATIO * largest table size
+SAFE_MIN_FREE_RATIO="${SAFE_MIN_FREE_RATIO:-2.0}"
+# Consider server "busy" if Threads_running exceeds this
+SAFE_MAX_THREADS_RUNNING="${SAFE_MAX_THREADS_RUNNING:-25}"
+# Treat these hours (local time) as "peak"; OPTIMIZE avoided unless --force
+# Comma-separated 24h hour numbers, e.g. "8-20" = 08:00..20:59
+SAFE_PEAK_HOURS="${SAFE_PEAK_HOURS:-8-20}"
+# Auto-safe on (1) / off (0)
+MAINT_SAFE_AUTO="${MAINT_SAFE_AUTO:-1}"
+
+# --- helpers ---
+get_free_mb() {
+  # Arg: path; prints integer MB free (0 on error)
+  local p="${1:-/var/lib/mysql}"
+  df -BM "$p" 2>/dev/null | awk 'NR==2{gsub(/M/,"",$4); print int($4)}'
+}
+
+get_largest_table_mb() {
+  # Uses information_schema; returns MB (integer, 0 if none)
+  "$MYSQL" --login-path="$LOGIN_PATH" -N -e "
+    SELECT COALESCE(ROUND(MAX((data_length+index_length)/1024/1024)),0)
+    FROM information_schema.TABLES
+    WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys');" 2>/dev/null \
+  | awk '{print int($1)}'
+}
+
+get_threads_running() {
+  "$MYSQL" --login-path="$LOGIN_PATH" -N -e "SHOW GLOBAL STATUS LIKE 'Threads_running';" 2>/dev/null \
+    | awk '{print ($2+0)}'
+}
+
+replication_lag_seconds() {
+  # Works on MySQL/MariaDB; returns seconds or 0 if not a replica / unknown
+  local lag=0
+  # Try standard SHOW SLAVE/REPLICA STATUS
+  local out
+  out=$("$MYSQL" --login-path="$LOGIN_PATH" -e "SHOW SLAVE STATUS\G" 2>/dev/null || true)
+  if [[ -n "$out" ]]; then
+    lag=$(printf "%s\n" "$out" | awk -F': ' '/Seconds_Behind_Master/{print $2+0; exit}')
+  else
+    out=$("$MYSQL" --login-path="$LOGIN_PATH" -e "SHOW REPLICA STATUS\G" 2>/dev/null || true)
+    if [[ -n "$out" ]]; then
+      lag=$(printf "%s\n" "$out" | awk -F': ' '/Seconds_Behind_Source/{print $2+0; exit}')
+      (( lag == 0 )) && lag=$(printf "%s\n" "$out" | awk -F': ' '/Seconds_Behind_Master/{print $2+0; exit}')
+    fi
+  fi
+  echo $((lag+0))
+}
+
+_in_peak_hours() {
+  # Parses SAFE_PEAK_HOURS like "8-20" or "9-12,14-18"
+  local spec="$SAFE_PEAK_HOURS"
+  [[ -z "$spec" ]] && return 1
+  local h now
+  now=$(date +%H) || now=0
+  IFS=',' read -r -a parts <<< "$spec"
+  for part in "${parts[@]}"; do
+    if [[ "$part" =~ ^([0-9]{1,2})-([0-9]{1,2})$ ]]; then
+      local a=${BASH_REMATCH[1]} b=${BASH_REMATCH[2]}
+      (( a <= now && now <= b )) && return 0
+    elif [[ "$part" =~ ^[0-9]{1,2}$ ]]; then
+      (( part == now )) && return 0
+    fi
+  done
+  return 1
+}
+
+should_safe_mode() {
+  # Returns 0 (true) if we should force safe mode; 1 otherwise
+  [[ "$MAINT_SAFE_AUTO" != "1" ]] && return 1
+
+  local free_mb largest_mb threads lag
+  free_mb=$(get_free_mb "/var/lib/mysql")
+  largest_mb=$(get_largest_table_mb)
+  threads=$(get_threads_running || echo 0)
+  lag=$(replication_lag_seconds || echo 0)
+
+  # Free space checks
+  local min_free_mb=$(( SAFE_MIN_FREE_GB * 1024 ))
+  local ratio_need_mb
+  # ratio * largest_table (rounded up)
+  ratio_need_mb=$(python3 - <<PY 2>/dev/null || echo 0
+r = float("${SAFE_MIN_FREE_RATIO:-2.0}")
+l = int("${largest_mb:-0}")
+print(int(round(r*l)))
+PY
+)
+  (( ratio_need_mb == 0 )) && ratio_need_mb=$(( (largest_mb * 2) ))  # fallback
+
+  # Trigger conditions
+  if (( free_mb < min_free_mb )); then
+    debug "Auto-safe: free_mb($free_mb) < min_free_mb($min_free_mb)"
+    return 0
+  fi
+  if (( free_mb < ratio_need_mb )); then
+    debug "Auto-safe: free_mb($free_mb) < ratio_need_mb($ratio_need_mb)"
+    return 0
+  fi
+  if (( threads > SAFE_MAX_THREADS_RUNNING )); then
+    debug "Auto-safe: Threads_running($threads) > threshold($SAFE_MAX_THREADS_RUNNING)"
+    return 0
+  fi
+  if _in_peak_hours; then
+    debug "Auto-safe: peak hours active ($SAFE_PEAK_HOURS)"
+    return 0
+  fi
+  if (( lag > 120 )); then
+    debug "Auto-safe: replication lag ($lag s) > 120 s"
+    return 0
+  fi
+
+  return 1
+}
+
 
 # ========================== Utility Functions ==========================
 
@@ -188,6 +311,87 @@ print_summary() {
     printf '%s\n' "${BACKUP_SUMMARY[@]}" >&2
 }
 
+# ---------- Auto-tune parallelism ----------
+auto_parallel_jobs() {
+  # If user/config already set a positive int, respect it
+  if [[ -n "${PARALLEL_JOBS:-}" && "${PARALLEL_JOBS}" =~ ^[0-9]+$ && "${PARALLEL_JOBS}" -ge 1 ]]; then
+    echo "$PARALLEL_JOBS"; return 0
+  fi
+
+  # Detect physical CPU availability (respecting cgroup quotas if any)
+  local host_cpus cfs_quota cfs_period cgroup_cpus
+  host_cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)
+
+  # cgroup v2
+  if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+    # Format: "<quota> <period>" or "max <period>"
+    read -r cfs_quota cfs_period < /sys/fs/cgroup/cpu.max
+    if [[ "$cfs_quota" != "max" && "$cfs_quota" =~ ^[0-9]+$ && "$cfs_period" =~ ^[0-9]+$ && "$cfs_period" -gt 0 ]]; then
+      cgroup_cpus=$(( (cfs_quota + cfs_period - 1) / cfs_period ))  # ceil
+    fi
+  fi
+  # cgroup v1 fallback
+  if [[ -z "${cgroup_cpus:-}" && -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
+    cfs_quota=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null || echo -1)
+    cfs_period=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null || echo 100000)
+    if [[ "$cfs_quota" -gt 0 && "$cfs_period" -gt 0 ]]; then
+      cgroup_cpus=$(( (cfs_quota + cfs_period - 1) / cfs_period ))  # ceil
+    fi
+  fi
+
+  local avail_cpus="${cgroup_cpus:-$host_cpus}"
+  (( avail_cpus < 1 )) && avail_cpus=1
+
+  # Disk heuristic: throttle a bit on spinning disks
+  local disk_is_rotational=0
+  # Try to detect the FS root backing device
+  local rootdev
+  rootdev=$(df --output=source / 2>/dev/null | awk 'NR==2{print $1}')
+  # Map to /sys/block/*/queue/rotational if possible
+  if [[ "$rootdev" =~ ^/dev/([a-zA-Z0-9]+) ]]; then
+    local blk="${BASH_REMATCH[1]}"
+    if [[ -r "/sys/block/$blk/queue/rotational" ]]; then
+      if [[ "$(cat /sys/block/$blk/queue/rotational 2>/dev/null)" == "1" ]]; then
+        disk_is_rotational=1
+      fi
+    fi
+  fi
+
+  # Current load: if the system is already hot, be conservative
+  local load1
+  load1=$(awk '{print int($1+0.5)}' /proc/loadavg 2>/dev/null || echo 0)
+
+  # Base: leave headroom for MySQL; target ~60–70% of CPUs
+  local base=$(( (avail_cpus * 2) / 3 ))
+  (( base < 1 )) && base=1
+
+  # If spinning disk, cap more aggressively (I/O bound)
+  local cap
+  if (( disk_is_rotational )); then
+    cap=$(( avail_cpus / 2 ))
+    (( cap < 1 )) && cap=1
+  else
+    # SSD/NVMe: allow more, but don't go wild
+    cap=$(( avail_cpus - 1 ))
+    (( cap < 1 )) && cap=1
+  fi
+
+  # If load already >= CPUs, halve our plan
+  if (( load1 >= avail_cpus )); then
+    base=$(( base / 2 ))
+    (( base < 1 )) && base=1
+  fi
+
+  # Final clamp and reasonable ceiling (avoid pathological values)
+  local jobs="$base"
+  (( jobs > cap )) && jobs="$cap"
+  (( jobs > 12 )) && jobs=12         # hard upper bound to be polite
+  (( jobs < 1 ))  && jobs=1
+
+  echo "$jobs"
+}
+
+
 generate_encryption_key() {
     local key_file="${1:-$ENCRYPTION_KEY_FILE}"
     
@@ -204,12 +408,16 @@ generate_encryption_key() {
     key_dir="$(dirname "$key_file")"
     mkdir -p "$key_dir" || err "Cannot create directory: $key_dir"
     
+    # Set secure umask before creating key file
+    local old_umask=$(umask)
+    umask 077
+    
     log INFO "Generating 256-bit encryption key..."
     
     # Generate a strong random key
     if have openssl; then
         openssl rand -base64 32 > "$key_file"
-    elif have /dev/urandom; then
+    elif [[ -r /dev/urandom ]]; then
         head -c 32 /dev/urandom | base64 > "$key_file"
     else
         err "Cannot generate random key: neither openssl nor /dev/urandom available"
@@ -230,41 +438,134 @@ generate_encryption_key() {
     log INFO "To enable encryption, set in your config:"
     echo "  ENCRYPT_BACKUPS=1"
     echo "  ENCRYPTION_KEY_FILE=\"$key_file\""
+    
+    # Restore original umask
+    umask "$old_umask"
 }
 
-trap print_summary EXIT
+stack_trap 'print_summary' EXIT
+
+# ========================== Signal Handling ==========================
+
+# Global state tracking
+declare -g OPERATION_IN_PROGRESS=""
+declare -g MYSQL_WAS_STOPPED=0
+declare -g DATADIR_BACKUP_PATH=""
+
+# Critical cleanup on exit/interrupt
+emergency_cleanup() {
+    local exit_code=$?
+    local signal="${1:-EXIT}"
+    
+    # Only log error if this is an actual error (not normal exit)
+    if [[ $exit_code -ne 0 ]]; then
+        log ERROR "Emergency cleanup triggered (signal: $signal, exit code: $exit_code)"
+    fi
+    
+    # If MySQL was stopped during restore, try to restart it
+    if [[ "$MYSQL_WAS_STOPPED" == "1" ]]; then
+        log ERROR "MySQL was stopped during operation! Attempting restart..."
+        
+        # If we have a backup of the original datadir, consider restoring it
+        if [[ -n "$DATADIR_BACKUP_PATH" ]] && [[ -d "$DATADIR_BACKUP_PATH" ]]; then
+            log ERROR "Original datadir backup exists at: $DATADIR_BACKUP_PATH"
+            log ERROR "Current /var/lib/mysql may be incomplete!"
+            log ERROR "MANUAL INTERVENTION REQUIRED!"
+            log ERROR "To rollback: systemctl stop mysql && rm -rf /var/lib/mysql && mv $DATADIR_BACKUP_PATH /var/lib/mysql && systemctl start mysql"
+        fi
+        
+        # Try to start MySQL anyway
+        if systemctl start mysql 2>/dev/null || systemctl start mysqld 2>/dev/null || systemctl start mariadb 2>/dev/null; then
+            log WARN "MySQL restarted, but database state is UNKNOWN - verify data integrity!"
+        else
+            log ERROR "Failed to restart MySQL! Database is DOWN!"
+            log ERROR "Check logs: journalctl -u mysql -n 100"
+        fi
+    fi
+    
+    # Clean up temp directories (only if there was an operation in progress that failed)
+    if [[ -n "$OPERATION_IN_PROGRESS" ]] && [[ $exit_code -ne 0 ]]; then
+        log WARN "Operation '$OPERATION_IN_PROGRESS' was interrupted"
+        
+        # Clean up any .partial files
+        find "$BACKUP_DIR" -name "*.partial" -type f -delete 2>/dev/null || true
+        
+        # Clean up temp restore directories
+        find "$BACKUP_DIR" -name ".xtra_restore_*" -type d -exec rm -rf {} + 2>/dev/null || true
+        find "$BACKUP_DIR" -name ".xtra_base_*" -type d -exec rm -rf {} + 2>/dev/null || true
+    fi
+    
+    # Release lock
+    release_lock
+    
+    # Send notification if this was an error
+    if [[ $exit_code -ne 0 ]] && [[ -n "$OPERATION_IN_PROGRESS" ]]; then
+        notify "db-tools FAILED: $OPERATION_IN_PROGRESS" \
+               "Operation interrupted with exit code $exit_code. Check logs immediately!" \
+               "error"
+    fi
+}
+
+# Set up signal handlers
+trap 'emergency_cleanup SIGINT' SIGINT   # Ctrl+C
+trap 'emergency_cleanup SIGTERM' SIGTERM # kill
+trap 'emergency_cleanup SIGHUP' SIGHUP   # Terminal closed
+trap 'emergency_cleanup EXIT' EXIT       # Normal/abnormal exit
 
 # ========================== Lock Management ==========================
 
 acquire_lock() {
   local timeout="${1:-300}"
+  local operation="${2:-operation}"  # What operation is locking
 
   if have flock; then
-    # Use FD 9 for the lock; keep it open for the process lifetime
+    # Use FD 9 for the lock
     exec 9>"$LOCK_FILE"
     if ! flock -n 9; then
-      err "Another db-tools instance holds the lock ($LOCK_FILE)."
+      # Read what process holds the lock
+      local lock_info
+      if [[ -f "$LOCK_FILE" ]]; then
+        lock_info=$(cat "$LOCK_FILE" 2>/dev/null || echo "unknown")
+        err "Another db-tools instance is already running: $lock_info (lock: $LOCK_FILE)"
+      else
+        err "Another db-tools instance holds the lock ($LOCK_FILE)."
+      fi
     fi
+    
+    # Write lock info
+    echo "PID:$$ OPERATION:$operation USER:$(whoami) STARTED:$(date '+%Y-%m-%d %H:%M:%S')" > "$LOCK_FILE"
     stack_trap 'release_lock' EXIT
-    debug "Lock acquired via flock (PID: $$)"
+    debug "Lock acquired for '$operation' (PID: $$)"
     return
   fi
 
-  # Fallback to manual lock file with timeout
+  # Fallback to manual lock file with timeout and PID checking
   local elapsed=0
   while [[ -f "$LOCK_FILE" ]]; do
     if (( elapsed >= timeout )); then
-      local pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "unknown")
-      err "Lock file exists (PID: $pid). Another instance running or stale lock?"
+      local lock_info=$(cat "$LOCK_FILE" 2>/dev/null || echo "unknown")
+      
+      # Check if the process is still running
+      if [[ "$lock_info" =~ PID:([0-9]+) ]]; then
+        local lock_pid="${BASH_REMATCH[1]}"
+        if ! kill -0 "$lock_pid" 2>/dev/null; then
+          warn "Stale lock file found (PID $lock_pid not running), removing..."
+          rm -f "$LOCK_FILE"
+          break
+        fi
+      fi
+      
+      err "Lock timeout: Another instance running for ${elapsed}s. Lock info: $lock_info"
     fi
-    debug "Waiting for lock... (${elapsed}s)"
+    
+    debug "Waiting for lock... (${elapsed}s) - Held by: $(cat "$LOCK_FILE" 2>/dev/null || echo 'unknown')"
     sleep 5
     ((elapsed+=5))
   done
 
-  echo $$ > "$LOCK_FILE"
+  echo "PID:$$ OPERATION:$operation USER:$(whoami) STARTED:$(date '+%Y-%m-%d %H:%M:%S')" > "$LOCK_FILE"
   stack_trap 'release_lock' EXIT
-  debug "Lock acquired (PID: $$)"
+  debug "Lock acquired for '$operation' (PID: $$)"
 }
 
 release_lock() {
@@ -272,6 +573,18 @@ release_lock() {
   { exec 9>&-; } 2>/dev/null || true
   rm -f "$LOCK_FILE"
   debug "Lock released"
+}
+
+# Helper to check if operation is locked
+is_locked() {
+  if [[ -f "$LOCK_FILE" ]]; then
+    local lock_info=$(cat "$LOCK_FILE" 2>/dev/null)
+    echo "yes: $lock_info"
+    return 0
+  else
+    echo "no"
+    return 1
+  fi
 }
 
 # ========================== Configuration Loading ==========================
@@ -294,6 +607,21 @@ need_tooling() {
     # Auto-install XtraBackup if backup method is xtrabackup and it's not found
     if [[ "$BACKUP_METHOD" == "xtrabackup" ]]; then
         if [[ -z "$XTRABACKUP" ]]; then
+            # Check if we already tried and failed
+            if [[ -f "$MARK_DIR/xtrabackup-install-failed" ]]; then
+                debug "XtraBackup install previously failed, using mysqldump"
+                BACKUP_METHOD="mysqldump"
+                return
+            fi
+            
+            # Check if auto-install is enabled
+            if [[ "${AUTO_INSTALL:-0}" != "1" ]]; then
+                warn "XtraBackup not found. Set AUTO_INSTALL=1 to enable auto-install, or install manually."
+                warn "Falling back to mysqldump for this operation."
+                BACKUP_METHOD="mysqldump"
+                return
+            fi
+            
             log INFO "XtraBackup not found, attempting auto-install..."
             if install_xtrabackup; then
                 log INFO "✅ XtraBackup auto-installed successfully"
@@ -302,6 +630,9 @@ need_tooling() {
             else
                 warn "XtraBackup auto-install failed, falling back to mysqldump"
                 BACKUP_METHOD="mysqldump"
+                # Mark that we tried and failed (avoid repeated attempts)
+                mkdir -p "$MARK_DIR"
+                touch "$MARK_DIR/xtrabackup-install-failed"
             fi
         else
             debug "Using XtraBackup at: $XTRABACKUP"
@@ -346,30 +677,64 @@ stack_trap() {
 
 check_key_perms() {
   [[ "$ENCRYPT_BACKUPS" == "1" && -n "$ENCRYPTION_KEY_FILE" ]] || return 0
-  
-  [[ -f "$ENCRYPTION_KEY_FILE" ]] || err "Encryption key file not found: $ENCRYPTION_KEY_FILE"
-  
-  # Check permissions - must be 600 or 400
-  if perms=$(stat -c '%a' "$ENCRYPTION_KEY_FILE" 2>/dev/null); then
-    if (( perms > 600 )); then
-      err "SECURITY: Encryption key permissions are $perms (must be 600 or stricter). Fix with: chmod 600 $ENCRYPTION_KEY_FILE"
-    fi
-  elif perms=$(stat -f '%Lp' "$ENCRYPTION_KEY_FILE" 2>/dev/null); then
-    # BSD stat fallback
-    if (( perms > 600 )); then
-      err "SECURITY: Encryption key permissions are $perms (must be 600 or stricter). Fix with: chmod 600 $ENCRYPTION_KEY_FILE"
-    fi
+
+  # Must exist and not be a symlink
+  [[ -e "$ENCRYPTION_KEY_FILE" ]] || err "Encryption key file not found: $ENCRYPTION_KEY_FILE"
+  if [[ -L "$ENCRYPTION_KEY_FILE" ]]; then
+    err "SECURITY: Key file is a symlink. Use a regular file at $ENCRYPTION_KEY_FILE"
   fi
-  
-  # Check ownership (should be current user or root)
+
+  # Ownership: prefer root or current user
+  local owner=""
   if owner=$(stat -c '%U' "$ENCRYPTION_KEY_FILE" 2>/dev/null); then
-    if [[ "$owner" != "$USER" && "$owner" != "root" && "$EUID" -ne 0 ]]; then
-      warn "Encryption key owned by $owner (expected $USER or root)"
+    :
+  else
+    owner=$(stat -f '%Su' "$ENCRYPTION_KEY_FILE" 2>/dev/null || echo "")
+  fi
+  if [[ -n "$owner" && "$owner" != "root" && "$owner" != "$USER" ]]; then
+    warn "Encryption key owned by '$owner' (expected root or $USER)"
+  fi
+
+  # Permissions: 400 or 600 acceptable; nothing broader.
+  local perms=""
+  if perms=$(stat -c '%a' "$ENCRYPTION_KEY_FILE" 2>/dev/null); then
+    :
+  else
+    perms=$(stat -f '%Lp' "$ENCRYPTION_KEY_FILE" 2>/dev/null || echo "000")
+  fi
+  # strip leading zeros if any
+  perms="${perms##+(0)}"
+  [[ -z "$perms" ]] && perms="0"
+
+  # numeric compare (treat anything > 600 as too broad)
+  if (( 10#$perms > 600 )); then
+    err "SECURITY: Key permissions are $perms (must be 600 or stricter). Fix with: chmod 600 $ENCRYPTION_KEY_FILE"
+  fi
+
+  # ACL check (if tools present)
+  if have getfacl; then
+    # Allow only owner entry and mask/defaults; no named users/groups with extra perms
+    local acl_extra
+    acl_extra=$(getfacl -p "$ENCRYPTION_KEY_FILE" 2>/dev/null | grep -E '^(user:|group:)[^:]+:' | grep -vE "^user::|^group::" || true)
+    if [[ -n "$acl_extra" ]]; then
+      warn "SECURITY: Key has extra ACL entries. Consider: setfacl -b $ENCRYPTION_KEY_FILE"
     fi
   fi
-  
+
+  # Content sanity (should look like a 256-bit base64 blob from generate_encryption_key)
+  # 32 bytes → base64 typically 44 chars with padding, but tolerate variations
+  local sample
+  sample="$(head -c 64 "$ENCRYPTION_KEY_FILE" 2>/dev/null | tr -d '\n' || true)"
+  if [[ -z "$sample" ]]; then
+    err "Key file is empty: $ENCRYPTION_KEY_FILE"
+  fi
+  if ! echo "$sample" | tr -d '[:space:]' | grep -Eq '^[A-Za-z0-9+/]+=*$'; then
+    warn "Key file does not appear to be base64; ensure it was created by 'db-tools genkey'"
+  fi
+
   debug "Encryption key permissions validated"
 }
+
 
 install_xtrabackup() {
     [[ "$EUID" -ne 0 ]] && { warn "Cannot auto-install without root"; return 1; }
@@ -516,11 +881,20 @@ get_extension() {
     esac
 }
 
+get_binlog_extension() {
+    case "$COMPRESS_ALGO" in
+        zstd) echo "binlog.zst" ;;
+        xz)   echo "binlog.xz"  ;;
+        pigz|gzip|*) echo "binlog.gz" ;;
+    esac
+}
+
 # ========================== Encryption Functions ==========================
 
 encrypt_if_enabled() {
     if [[ "$ENCRYPT_BACKUPS" == "1" ]] && [[ -n "$ENCRYPTION_KEY_FILE" ]] && [[ -f "$ENCRYPTION_KEY_FILE" ]]; then
-        openssl enc -aes-256-cbc -salt -pbkdf2 -pass file:"$ENCRYPTION_KEY_FILE"
+        # Use AES-256-GCM for authenticated encryption (AEAD)
+        openssl enc -aes-256-gcm -salt -pbkdf2 -pass file:"$ENCRYPTION_KEY_FILE"
     else
         cat
     fi
@@ -529,11 +903,38 @@ encrypt_if_enabled() {
 decrypt_if_encrypted() {
     local file="$1"
     if [[ "$file" =~ \.enc$ ]] && [[ -n "$ENCRYPTION_KEY_FILE" ]] && [[ -f "$ENCRYPTION_KEY_FILE" ]]; then
-        openssl enc -d -aes-256-cbc -pbkdf2 -pass file:"$ENCRYPTION_KEY_FILE"
+        # Use AES-256-GCM for authenticated decryption
+        openssl enc -d -aes-256-gcm -pbkdf2 -pass file:"$ENCRYPTION_KEY_FILE"
     else
         cat
     fi
 }
+
+# Strip/neutralize fragile clauses from dumps so restores succeed across hosts
+sanitize_dump_stream() {
+    # - Neutralize DEFINERs (procedures, views, triggers, events)
+    # - Remove versioned comments that set DEFINER (/*!50013 ... */ etc.)
+    # - Disable binary logging during import to avoid replica storms
+    # - Relax foreign key checks for faster & safer bulk load
+    # - Ensure SQL mode doesn't break old dumps
+    awk 'BEGIN {
+            print "SET @OLD_SQL_LOG_BIN=@@SQL_LOG_BIN; SET SQL_LOG_BIN=0;";
+            print "SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS; SET FOREIGN_KEY_CHECKS=0;";
+            print "SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS; SET UNIQUE_CHECKS=0;";
+            print "SET @OLD_SQL_MODE=@@SQL_MODE; SET SQL_MODE=\"\";";
+        }
+        { print }
+        END {
+            print "SET SQL_MODE=@OLD_SQL_MODE;";
+            print "SET UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS;";
+            print "SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS;";
+            print "SET SQL_LOG_BIN=@OLD_SQL_LOG_BIN;";
+        }' \
+    | sed -E \
+        -e 's/\/\*!([0-9]{5})[[:space:]]+DEFINER=`[^`]+`@`[^`]+`[[:space:]]*/\/*!\1 /g' \
+        -e 's/DEFINER=`[^`]+`@`[^`]+`/DEFINER=CURRENT_USER/g'
+}
+
 
 # ========================== Checksum Functions ==========================
 
@@ -586,6 +987,92 @@ notify() {
 }
 
 # ========================== MySQL Functions ==========================
+# ========================== Service Control Functions ==========================
+
+start_mysql() {
+    log INFO "Starting MySQL/MariaDB..."
+    
+    # Try systemd first
+    if systemctl start mysql 2>/dev/null; then
+        return 0
+    elif systemctl start mysqld 2>/dev/null; then
+        return 0
+    elif systemctl start mariadb 2>/dev/null; then
+        return 0
+    # Fallback to sysvinit
+    elif command -v service >/dev/null 2>&1; then
+        if service mysql start 2>/dev/null; then
+            return 0
+        elif service mysqld start 2>/dev/null; then
+            return 0
+        fi
+    fi
+    
+    # Last resort: try init.d directly
+    if [[ -x /etc/init.d/mysql ]]; then
+        /etc/init.d/mysql start
+        return $?
+    elif [[ -x /etc/init.d/mysqld ]]; then
+        /etc/init.d/mysqld start
+        return $?
+    fi
+    
+    return 1
+}
+
+stop_mysql() {
+    log INFO "Stopping MySQL/MariaDB..."
+    
+    # Try systemd first
+    if systemctl stop mysql 2>/dev/null; then
+        return 0
+    elif systemctl stop mysqld 2>/dev/null; then
+        return 0
+    elif systemctl stop mariadb 2>/dev/null; then
+        return 0
+    # Fallback to sysvinit
+    elif command -v service >/dev/null 2>&1; then
+        if service mysql stop 2>/dev/null; then
+            return 0
+        elif service mysqld stop 2>/dev/null; then
+            return 0
+        fi
+    fi
+    
+    # Last resort: try init.d directly
+    if [[ -x /etc/init.d/mysql ]]; then
+        /etc/init.d/mysql stop
+        return $?
+    elif [[ -x /etc/init.d/mysqld ]]; then
+        /etc/init.d/mysqld stop
+        return $?
+    fi
+    
+    return 1
+}
+
+is_mysql_running() {
+    if systemctl is-active --quiet mysql 2>/dev/null; then
+        return 0
+    elif systemctl is-active --quiet mysqld 2>/dev/null; then
+        return 0
+    elif systemctl is-active --quiet mariadb 2>/dev/null; then
+        return 0
+    elif command -v service >/dev/null 2>&1; then
+        if service mysql status >/dev/null 2>&1; then
+            return 0
+        elif service mysqld status >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    
+    # Check if MySQL process is running
+    if pgrep -x mysqld >/dev/null 2>&1 || pgrep -x mariadbd >/dev/null 2>&1; then
+        return 0
+    fi
+    
+    return 1
+}
 
 require_login() {
     if ! "$MYSQL" --login-path="$LOGIN_PATH" -e "SELECT 1;" >/dev/null 2>&1; then
@@ -628,6 +1115,65 @@ estimate_backup_size() {
     echo "${total_mb:-0}"
 }
 
+check_restore_space() {
+    local backup_file="$1"
+    local multiplier="${2:-3}"  # Need 3x: extract + prepare + copy
+    
+    # Get compressed backup size
+    local backup_size_mb=$(du -m "$backup_file" | cut -f1)
+    
+    # Estimate uncompressed size (assume 5:1 compression ratio)
+    local uncompressed_mb=$((backup_size_mb * 5))
+    
+    # Need space for: extraction + working directory + MySQL datadir
+    local required_mb=$((uncompressed_mb * multiplier))
+    
+    # Check backup directory space
+    local backup_avail=$(df -BM "$BACKUP_DIR" | awk 'NR==2 {print $4}' | sed 's/M//')
+    local datadir_avail=$(df -BM /var/lib/mysql | awk 'NR==2 {print $4}' | sed 's/M//')
+    
+    log INFO "Disk space check:"
+    log INFO "  Backup file: ${backup_size_mb}MB compressed"
+    log INFO "  Estimated uncompressed: ${uncompressed_mb}MB"
+    log INFO "  Required (${multiplier}x): ${required_mb}MB"
+    log INFO "  Available in backup dir: ${backup_avail}MB"
+    log INFO "  Available in MySQL datadir: ${datadir_avail}MB"
+    
+    if (( backup_avail < required_mb )); then
+        err "Insufficient disk space in $BACKUP_DIR! Need ${required_mb}MB, have ${backup_avail}MB"
+    fi
+    
+    if (( datadir_avail < uncompressed_mb )); then
+        err "Insufficient disk space in /var/lib/mysql! Need ${uncompressed_mb}MB, have ${datadir_avail}MB"
+    fi
+    
+    log INFO "✅ Sufficient disk space available"
+}
+
+check_backup_space() {
+    local backup_dir="$1"
+    local estimated_size_mb="$2"
+    local multiplier="${3:-4}"  # Need 4x: raw backup + compressed + working space + buffer
+    
+    local required_mb=$((estimated_size_mb * multiplier))
+    local available=$(df -BM "$backup_dir" | awk 'NR==2 {print $4}' | sed 's/M//')
+    
+    log INFO "Backup space check:"
+    log INFO "  Estimated DB size: ${estimated_size_mb}MB"
+    log INFO "  Required (${multiplier}x): ${required_mb}MB"
+    log INFO "  Available: ${available}MB"
+    
+    if (( available < required_mb )); then
+        err "Insufficient disk space! Need ${required_mb}MB, have ${available}MB. Free up space or increase retention."
+    fi
+    
+    if (( available < required_mb * 2 )); then
+        warn "Low disk space! Have ${available}MB, recommended ${required_mb * 2}MB"
+    fi
+    
+    log INFO "✅ Sufficient disk space available"
+}
+
 # ========================== Progress Functions ==========================
 
 # ========================== Initialization ==========================
@@ -664,7 +1210,7 @@ init() {
     ensure_compression_tools
     check_key_perms
     
-    mkdir -p "$BACKUP_DIR" "$MARK_DIR"
+    mkdir -p "$BACKUP_DIR" "$MARK_DIR" "$LOG_DIR" || err "Failed to create necessary directories"
     date -Is > "$MARK_INIT"
     
     log INFO "✅ Initialization complete"
@@ -680,7 +1226,7 @@ backup() {
     require_login
     ensure_compression_tools
     check_key_perms
-    acquire_lock
+    acquire_lock 300 "backup-$backup_type"  # ← Updated with operation name
     
     local estimated_size=$(estimate_backup_size)
     check_disk_space "$BACKUP_DIR" "$estimated_size"
@@ -710,10 +1256,16 @@ backup() {
 }
 
 backup_xtra_full() {
+    OPERATION_IN_PROGRESS="xtrabackup-full"
+    
     local ts="$(date +'%Y-%m-%d-%H-%M-%S')"
     local backup_dir="$BACKUP_DIR/xtra-full-$ts"
     
     log INFO "Starting XtraBackup full backup..."
+    
+    # Check disk space BEFORE starting backup
+    local estimated_size=$(estimate_backup_size)
+    check_backup_space "$BACKUP_DIR" "$estimated_size" 4
     
     # Cleanup old backups first
     cleanup_old_backups
@@ -745,9 +1297,9 @@ backup_xtra_full() {
     
     # Get MySQL credentials from login-path
     local mysql_user mysql_pass mysql_host mysql_port
-    mysql_host=$(mysql_config_editor print --login-path="$LOGIN_PATH" 2>/dev/null | grep host | cut -d= -f2 | tr -d ' ')
-    mysql_port=$(mysql_config_editor print --login-path="$LOGIN_PATH" 2>/dev/null | grep port | cut -d= -f2 | tr -d ' ')
-    mysql_user=$(mysql_config_editor print --login-path="$LOGIN_PATH" 2>/dev/null | grep user | cut -d= -f2 | tr -d ' ')
+    mysql_host=$(mysql_config_editor print --login-path="$LOGIN_PATH" 2>/dev/null | grep host | cut -d= -f2 | tr -d ' ' | tr -d '"')
+    mysql_port=$(mysql_config_editor print --login-path="$LOGIN_PATH" 2>/dev/null | grep port | cut -d= -f2 | tr -d ' ' | tr -d '"')
+    mysql_user=$(mysql_config_editor print --login-path="$LOGIN_PATH" 2>/dev/null | grep user | cut -d= -f2 | tr -d ' ' | tr -d '"')
     
     [[ -n "$mysql_host" ]] && xtra_cmd+=(--host="$mysql_host")
     [[ -n "$mysql_port" ]] && xtra_cmd+=(--port="$mysql_port")
@@ -761,13 +1313,30 @@ backup_xtra_full() {
         {
             echo "timestamp=$ts"
             echo "backup_type=xtrabackup-full"
-            echo "backup_method=xtrabackup"
             echo "xtrabackup_version=$($XTRABACKUP --version 2>&1 | head -1)"
             echo "server_version=$("$MYSQL" --login-path="$LOGIN_PATH" -N -e 'SELECT VERSION();')"
+            echo "compression_algo=$COMPRESS_ALGO"
+            echo "compression_level=$COMPRESS_LEVEL"
+            echo "parallel_jobs=$PARALLEL_JOBS"
+            echo "backup_method=$BACKUP_METHOD"
+            if [[ "$ENCRYPT_BACKUPS" == "1" ]]; then
+                echo "encryption_cipher=aes-256-gcm"
+            fi         
+            
+            # Get GTID info if enabled
+            local gtid_mode
+            gtid_mode=$("$MYSQL" --login-path="$LOGIN_PATH" -N -e "SHOW VARIABLES LIKE 'gtid_mode';" 2>/dev/null | awk '{print $2}' || echo "OFF")
+            echo "gtid_mode=$gtid_mode"
+            
+            if [[ "$gtid_mode" == "ON" ]]; then
+                local gtid_executed
+                gtid_executed=$("$MYSQL" --login-path="$LOGIN_PATH" -N -e "SELECT @@GLOBAL.gtid_executed;" 2>/dev/null || echo "")
+                echo "gtid_executed=$gtid_executed"
+            fi
             
             # Extract LSN from xtrabackup_checkpoints
             if [[ -f "$backup_dir/xtrabackup_checkpoints" ]]; then
-                grep "^to_lsn" "$backup_dir/xtrabackup_checkpoints" >> "$BACKUP_DIR/backup-$ts.meta"
+                grep "^to_lsn" "$backup_dir/xtrabackup_checkpoints"
             fi
             
             # Get binlog position
@@ -779,18 +1348,22 @@ backup_xtra_full() {
             fi
         } > "$BACKUP_DIR/backup-$ts.meta"
         
-        # Encrypt if enabled
+        # Compress/package backup with .partial suffix
+        log INFO "Compressing backup..."
         if [[ "$ENCRYPT_BACKUPS" == "1" ]]; then
-            log INFO "Encrypting backup..."
             tar -cf - -C "$BACKUP_DIR" "xtra-full-$ts" | \
-                encrypt_if_enabled > "$BACKUP_DIR/xtra-full-$ts.tar.enc"
+                encrypt_if_enabled > "$BACKUP_DIR/xtra-full-$ts.tar.enc.partial"
+            
+            mv "$BACKUP_DIR/xtra-full-$ts.tar.enc.partial" "$BACKUP_DIR/xtra-full-$ts.tar.enc"
             rm -rf "$backup_dir"
             backup_dir="$BACKUP_DIR/xtra-full-$ts.tar.enc"
         else
-            # Tar it for easier management
-            tar -czf "$BACKUP_DIR/xtra-full-$ts.tar.gz" -C "$BACKUP_DIR" "xtra-full-$ts"
+            # Don't double-compress! XtraBackup already compressed
+            tar -cf "$BACKUP_DIR/xtra-full-$ts.tar.partial" -C "$BACKUP_DIR" "xtra-full-$ts"
+            
+            mv "$BACKUP_DIR/xtra-full-$ts.tar.partial" "$BACKUP_DIR/xtra-full-$ts.tar"
             rm -rf "$backup_dir"
-            backup_dir="$BACKUP_DIR/xtra-full-$ts.tar.gz"
+            backup_dir="$BACKUP_DIR/xtra-full-$ts.tar"
         fi
         
         # Create checksum
@@ -799,19 +1372,24 @@ backup_xtra_full() {
         log INFO "✅ XtraBackup full backup complete: $(basename "$backup_dir")"
         add_summary "XtraBackup full backup: $(basename "$backup_dir")"
         notify "Backup completed successfully" "XtraBackup full backup completed" "info"
+        
+        OPERATION_IN_PROGRESS=""
         return 0
     else
+        OPERATION_IN_PROGRESS=""
         err "XtraBackup full backup failed. Check $backup_dir/xtrabackup.log"
     fi
 }
 
 backup_xtra_incremental() {
+    OPERATION_IN_PROGRESS="xtrabackup-incremental"
+    
     local ts="$(date +'%Y-%m-%d-%H-%M-%S')"
     
-    # Find base backup
+    # Find base backup (physical full)
     local base_backup
-    base_backup=$(find "$BACKUP_DIR" -maxdepth 1 \( -name "xtra-full-*.tar.gz" -o -name "xtra-full-*.tar.enc" \) 2>/dev/null | sort -r | head -1)
-    
+    base_backup=$(find "$BACKUP_DIR" -maxdepth 1 \( -name "xtra-full-*.tar.gz" -o -name "xtra-full-*.tar.enc" -o -name "xtra-full-*.tar" \) 2>/dev/null | sort -r | head -1)
+
     if [[ -z "$base_backup" ]]; then
         warn "No full XtraBackup found, creating full backup instead"
         backup_xtra_full
@@ -819,19 +1397,22 @@ backup_xtra_incremental() {
     fi
     
     log INFO "Starting XtraBackup incremental backup..."
+    log INFO "Base backup: $(basename "$base_backup")"
     
     # Extract base backup to temp location
     local temp_base="$BACKUP_DIR/.xtra_base_$$"
     mkdir -p "$temp_base"
     stack_trap "rm -rf '$temp_base'" EXIT
     
+    log INFO "Extracting base backup for incremental..."
     if [[ "$base_backup" =~ \.enc$ ]]; then
-        decrypt_if_encrypted "$base_backup" < "$base_backup" | tar -xzf - -C "$temp_base"
+        decrypt_if_encrypted "$base_backup" < "$base_backup" | tar -xf - -C "$temp_base"
     else
-        tar -xzf "$base_backup" -C "$temp_base"
+        tar -xf "$base_backup" -C "$temp_base"
     fi
     
-    local base_dir=$(find "$temp_base" -maxdepth 1 -type d -name "xtra-full-*" | head -1)
+    local base_dir
+    base_dir=$(find "$temp_base" -maxdepth 1 -type d -name "xtra-full-*" | head -1)
     [[ -z "$base_dir" ]] && err "Cannot find extracted base backup"
     
     local backup_dir="$BACKUP_DIR/xtra-incr-$ts"
@@ -844,204 +1425,251 @@ backup_xtra_incremental() {
     xtra_cmd+=(--parallel="$XTRABACKUP_PARALLEL")
     
     # Add compression
-    if [[ "$XTRABACKUP_COMPRESS" == "1" ]] && have qpress; then
-        xtra_cmd+=(--compress)
-        xtra_cmd+=(--compress-threads="$XTRABACKUP_COMPRESS_THREADS")
+    if [[ "$XTRABACKUP_COMPRESS" == "1" ]]; then
+        case "$COMPRESS_ALGO" in
+            zstd)
+                if have zstd; then
+                    xtra_cmd+=(--compress=zstd)
+                    xtra_cmd+=(--compress-threads="$XTRABACKUP_COMPRESS_THREADS")
+                fi
+                ;;
+            *)
+                if have qpress; then
+                    xtra_cmd+=(--compress)
+                    xtra_cmd+=(--compress-threads="$XTRABACKUP_COMPRESS_THREADS")
+                fi
+                ;;
+        esac
     fi
     
-    # Get credentials
+    # Credentials from login-path
     local mysql_user mysql_host mysql_port
-    mysql_host=$(mysql_config_editor print --login-path="$LOGIN_PATH" 2>/dev/null | grep host | cut -d= -f2 | tr -d ' ')
-    mysql_port=$(mysql_config_editor print --login-path="$LOGIN_PATH" 2>/dev/null | grep port | cut -d= -f2 | tr -d ' ')
-    mysql_user=$(mysql_config_editor print --login-path="$LOGIN_PATH" 2>/dev/null | grep user | cut -d= -f2 | tr -d ' ')
+    mysql_host=$(mysql_config_editor print --login-path="$LOGIN_PATH" 2>/dev/null | grep host | cut -d= -f2 | tr -d ' ' | tr -d '"')
+    mysql_port=$(mysql_config_editor print --login-path="$LOGIN_PATH" 2>/dev/null | grep port | cut -d= -f2 | tr -d ' ' | tr -d '"')
+    mysql_user=$(mysql_config_editor print --login-path="$LOGIN_PATH" 2>/dev/null | grep user | cut -d= -f2 | tr -d ' ' | tr -d '"')
     
     [[ -n "$mysql_host" ]] && xtra_cmd+=(--host="$mysql_host")
     [[ -n "$mysql_port" ]] && xtra_cmd+=(--port="$mysql_port")
     [[ -n "$mysql_user" ]] && xtra_cmd+=(--user="$mysql_user")
     
+    log INFO "Executing: ${xtra_cmd[*]}"
+    
     if "${xtra_cmd[@]}" 2>"$backup_dir/xtrabackup.log"; then
-        # Save metadata
         {
             echo "timestamp=$ts"
             echo "backup_type=xtrabackup-incremental"
-            echo "backup_method=xtrabackup"
             echo "base_backup=$(basename "$base_backup")"
-            
+            echo "xtrabackup_version=$($XTRABACKUP --version 2>&1 | head -1)"
+            echo "compression_algo=$COMPRESS_ALGO"
+            echo "compression_level=$COMPRESS_LEVEL"
+            echo "parallel_jobs=$PARALLEL_JOBS"
+            echo "backup_method=$BACKUP_METHOD"
+            if [[ "$ENCRYPT_BACKUPS" == "1" ]]; then
+                echo "encryption_cipher=aes-256-gcm"
+            fi
             if [[ -f "$backup_dir/xtrabackup_checkpoints" ]]; then
+                grep "^from_lsn" "$backup_dir/xtrabackup_checkpoints"
                 grep "^to_lsn" "$backup_dir/xtrabackup_checkpoints"
             fi
         } > "$BACKUP_DIR/backup-$ts.meta"
         
-        # Package incremental
+        log INFO "Compressing incremental backup..."
         if [[ "$ENCRYPT_BACKUPS" == "1" ]]; then
             tar -cf - -C "$BACKUP_DIR" "xtra-incr-$ts" | \
-                encrypt_if_enabled > "$BACKUP_DIR/xtra-incr-$ts.tar.enc"
+                encrypt_if_enabled > "$BACKUP_DIR/xtra-incr-$ts.tar.enc.partial"
+            mv "$BACKUP_DIR/xtra-incr-$ts.tar.enc.partial" "$BACKUP_DIR/xtra-incr-$ts.tar.enc"
             rm -rf "$backup_dir"
-            backup_dir="$BACKUP_DIR/xtra-incr-$ts.tar.enc"
         else
-            tar -czf "$BACKUP_DIR/xtra-incr-$ts.tar.gz" -C "$BACKUP_DIR" "xtra-incr-$ts"
+            tar -cf "$BACKUP_DIR/xtra-incr-$ts.tar.partial" -C "$BACKUP_DIR" "xtra-incr-$ts"
+            mv "$BACKUP_DIR/xtra-incr-$ts.tar.partial" "$BACKUP_DIR/xtra-incr-$ts.tar"
             rm -rf "$backup_dir"
-            backup_dir="$BACKUP_DIR/xtra-incr-$ts.tar.gz"
         fi
         
-        create_checksum "$backup_dir"
+        local packed="$BACKUP_DIR/xtra-incr-$ts.tar"
+        [[ "$ENCRYPT_BACKUPS" == "1" ]] && packed="${packed}.enc"
+        create_checksum "$packed"
         
-        log INFO "✅ XtraBackup incremental backup complete: $(basename "$backup_dir")"
-        add_summary "XtraBackup incremental backup: $(basename "$backup_dir")"
+        log INFO "✅ XtraBackup incremental backup complete: $(basename "$packed")"
+        add_summary "XtraBackup incremental backup: $(basename "$packed")"
         notify "Incremental backup completed" "XtraBackup incremental backup completed" "info"
+        
+        OPERATION_IN_PROGRESS=""
+        return 0
     else
-        err "XtraBackup incremental backup failed"
+        OPERATION_IN_PROGRESS=""
+        err "XtraBackup incremental backup failed. Check $backup_dir/xtrabackup.log"
     fi
 }
 
+
 restore_xtra() {
+    OPERATION_IN_PROGRESS="xtrabackup-restore"
+    
     local backup_file="$1"
     local target_db="${2:-}"
     local until_time="${3:-}"
     
     log INFO "Restoring from XtraBackup: $(basename "$backup_file")"
     
-    # Verify checksum
+    check_restore_space "$backup_file" 3
     verify_checksum "$backup_file" || warn "Checksum verification failed"
     
-    # Extract backup
     local temp_restore="$BACKUP_DIR/.xtra_restore_$$"
     mkdir -p "$temp_restore"
     stack_trap "rm -rf '$temp_restore'" EXIT
     
     log INFO "Extracting backup..."
     if [[ "$backup_file" =~ \.enc$ ]]; then
-        decrypt_if_encrypted "$backup_file" < "$backup_file" | tar -xzf - -C "$temp_restore"
+        decrypt_if_encrypted "$backup_file" < "$backup_file" | tar -xf - -C "$temp_restore"
     else
-        tar -xzf "$backup_file" -C "$temp_restore"
+        tar -xf "$backup_file" -C "$temp_restore"
     fi
     
-    local backup_dir=$(find "$temp_restore" -maxdepth 1 -type d -name "xtra-*" | head -1)
+    local backup_dir
+    backup_dir=$(find "$temp_restore" -maxdepth 1 -type d -name "xtra-*" | head -1)
     [[ -z "$backup_dir" ]] && err "Cannot find extracted backup"
     
-    # Decompress if needed
     if [[ -f "$backup_dir/xtrabackup_checkpoints" ]]; then
         if grep -q "compressed = 1" "$backup_dir/xtrabackup_checkpoints" 2>/dev/null; then
             log INFO "Decompressing backup..."
             "$XTRABACKUP" --decompress --target-dir="$backup_dir" \
                 --parallel="$XTRABACKUP_PARALLEL" || err "Decompression failed"
-            
-            # Remove .qp files
-            find "$backup_dir" -name "*.qp" -delete
+            find "$backup_dir" -name "*.qp" -o -name "*.zst" -delete
         fi
     fi
     
-    # Apply incrementals if any
     local base_ts
     base_ts=$(basename "$backup_file" | grep -oP '\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}')
     
-    local incrementals=()
-    while IFS= read -r incr; do
-        incrementals+=("$incr")
-    done < <(find "$BACKUP_DIR" -name "xtra-incr-*.tar.*" 2>/dev/null | sort)
-    
-    if [[ ${#incrementals[@]} -gt 0 ]]; then
-        log INFO "Found ${#incrementals[@]} incremental backup(s) to apply"
-        
-        # First prepare base with --apply-log-only
-        log INFO "Preparing base backup..."
-        "$XTRABACKUP" --prepare --apply-log-only \
-            --target-dir="$backup_dir" \
-            --use-memory="$XTRABACKUP_MEMORY" || err "Base prepare failed"
-        
-        # Apply each incremental
-        for incr in "${incrementals[@]}"; do
-            log INFO "Applying incremental: $(basename "$incr")"
-            
-            local temp_incr="$temp_restore/incr_$$"
-            mkdir -p "$temp_incr"
-            
-            if [[ "$incr" =~ \.enc$ ]]; then
-                decrypt_if_encrypted "$incr" < "$incr" | tar -xzf - -C "$temp_incr"
+    if [[ -z "$base_ts" ]]; then
+        warn "Cannot determine timestamp from backup filename, skipping incrementals"
+    else
+        log INFO "Base backup timestamp: $base_ts"
+        local incrementals=()
+        while IFS= read -r incr; do
+            local incr_ts
+            incr_ts=$(basename "$incr" | grep -oP '\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}')
+            if [[ "$incr_ts" > "$base_ts" ]]; then
+                incrementals+=("$incr")
             else
-                tar -xzf "$incr" -C "$temp_incr"
+                debug "Skipping old incremental: $(basename "$incr") (before $base_ts)"
             fi
+        done < <(find "$BACKUP_DIR" -name "xtra-incr-*.tar.*" 2>/dev/null | sort)
+        
+        if [[ ${#incrementals[@]} -gt 0 ]]; then
+            log INFO "Found ${#incrementals[@]} incremental backup(s) to apply (created after $base_ts)"
             
-            local incr_dir=$(find "$temp_incr" -maxdepth 1 -type d -name "xtra-incr-*" | head -1)
-            
-            # Decompress incremental if needed
-            if [[ -f "$incr_dir/xtrabackup_checkpoints" ]]; then
-                if grep -q "compressed = 1" "$incr_dir/xtrabackup_checkpoints" 2>/dev/null; then
-                    "$XTRABACKUP" --decompress --target-dir="$incr_dir" \
-                        --parallel="$XTRABACKUP_PARALLEL"
-                    find "$incr_dir" -name "*.qp" -delete
-                fi
-            fi
-            
+            log INFO "Preparing base backup..."
             "$XTRABACKUP" --prepare --apply-log-only \
                 --target-dir="$backup_dir" \
-                --incremental-dir="$incr_dir" \
-                --use-memory="$XTRABACKUP_MEMORY" || err "Incremental apply failed"
+                --use-memory="$XTRABACKUP_MEMORY" || err "Base prepare failed"
             
-            rm -rf "$temp_incr"
-        done
+            for incr in "${incrementals[@]}"; do
+                log INFO "Applying incremental: $(basename "$incr")"
+                local temp_incr="$temp_restore/incr_$$"
+                mkdir -p "$temp_incr"
+                
+                if [[ "$incr" =~ \.enc$ ]]; then
+                    decrypt_if_encrypted "$incr" < "$incr" | tar -xf - -C "$temp_incr"
+                else
+                    tar -xf "$incr" -C "$temp_incr"
+                fi
+                
+                local incr_dir
+                incr_dir=$(find "$temp_incr" -maxdepth 1 -type d -name "xtra-incr-*" | head -1)
+                
+                if [[ -f "$incr_dir/xtrabackup_checkpoints" ]]; then
+                    if grep -q "compressed = 1" "$incr_dir/xtrabackup_checkpoints" 2>/dev/null; then
+                        "$XTRABACKUP" --decompress --target-dir="$incr_dir" \
+                            --parallel="$XTRABACKUP_PARALLEL"
+                        find "$incr_dir" -name "*.qp" -o -name "*.zst" -delete
+                    fi
+                fi
+                
+                "$XTRABACKUP" --prepare --apply-log-only \
+                    --target-dir="$backup_dir" \
+                    --incremental-dir="$incr_dir" \
+                    --use-memory="$XTRABACKUP_MEMORY" || err "Incremental apply failed"
+                
+                rm -rf "$temp_incr"
+            done
+        else
+            log INFO "No incremental backups found to apply"
+        fi
     fi
     
-    # Final prepare
     log INFO "Final prepare..."
     "$XTRABACKUP" --prepare \
         --target-dir="$backup_dir" \
         --use-memory="$XTRABACKUP_MEMORY" || err "Final prepare failed"
     
-    # Stop MySQL
-    log INFO "Stopping MySQL..."
-    if systemctl is-active --quiet mysql; then
-        systemctl stop mysql || systemctl stop mysqld || err "Cannot stop MySQL"
-    elif systemctl is-active --quiet mariadb; then
-        systemctl stop mariadb || err "Cannot stop MariaDB"
-    else
-        err "MySQL/MariaDB service not found"
+    log WARN "=== CRITICAL: Stopping MySQL for restore ==="
+    log WARN "Do NOT interrupt this process!"
+    MYSQL_WAS_STOPPED=1
+    
+    if ! stop_mysql; then
+        err "Cannot stop MySQL/MariaDB"
     fi
     
-    # Backup current datadir
     local datadir="/var/lib/mysql"
     local backup_old="$datadir.backup.$(date +%s)"
+    DATADIR_BACKUP_PATH="$backup_old"
+    
     log INFO "Backing up current datadir to $backup_old"
     mv "$datadir" "$backup_old" || err "Cannot backup current datadir"
     mkdir -p "$datadir"
     
-    # Copy back
-    log INFO "Copying backup to datadir..."
-    "$XTRABACKUP" --copy-back --target-dir="$backup_dir" || {
-        log ERROR "Copy-back failed, restoring original datadir"
+    log INFO "Copying backup to datadir... (this may take several minutes)"
+    if ! "$XTRABACKUP" --copy-back --target-dir="$backup_dir"; then
+        log ERROR "Copy-back failed!"
+        log ERROR "Attempting to restore original datadir..."
         rm -rf "$datadir"
         mv "$backup_old" "$datadir"
-        err "Restore failed"
-    }
+        DATADIR_BACKUP_PATH=""
+        MYSQL_WAS_STOPPED=0
+        err "Restore failed - original datadir restored"
+    fi
     
-    # Fix permissions
-    chown -R mysql:mysql "$datadir" || chown -R mysql:mysql "$datadir"
+    if chown -R mysql:mysql "$datadir" 2>/dev/null; then
+        debug "Set ownership to mysql:mysql"
+    elif chown -R mariadb:mariadb "$datadir" 2>/dev/null; then
+        debug "Set ownership to mariadb:mariadb"
+    else
+        warn "Could not set standard ownership (mysql or mariadb user not found)"
+    fi
     
-    # Start MySQL
+    if command -v restorecon >/dev/null 2>&1; then
+        log INFO "Restoring SELinux contexts..."
+        restorecon -Rv "$datadir" 2>&1 | head -20 || true
+    fi
+    
     log INFO "Starting MySQL..."
-    if systemctl start mysql || systemctl start mysqld || systemctl start mariadb; then
+    if start_mysql; then
         log INFO "✅ XtraBackup restore complete"
+        MYSQL_WAS_STOPPED=0
+        DATADIR_BACKUP_PATH=""
         
-        # PITR if requested
         if [[ -n "$until_time" ]]; then
-            # Extract binlog info from backup
             if [[ -f "$backup_dir/xtrabackup_binlog_info" ]]; then
                 local binlog_file binlog_pos
                 binlog_file=$(awk '{print $1}' "$backup_dir/xtrabackup_binlog_info")
                 binlog_pos=$(awk '{print $2}' "$backup_dir/xtrabackup_binlog_info")
                 
                 log INFO "Applying binlogs from $binlog_file:$binlog_pos to $until_time"
-                
-                # Apply binlogs
                 run_pitr_from_position "$binlog_file" "$binlog_pos" "$until_time"
             fi
         fi
         
+        log INFO "Restore successful. Old datadir backup kept at: $backup_old"
+        log INFO "You can remove it manually after verifying the restore: rm -rf $backup_old"
+        
         add_summary "XtraBackup restore: Success"
+        OPERATION_IN_PROGRESS=""
     else
-        err "Cannot start MySQL after restore"
+        err "Cannot start MySQL after restore - CHECK IMMEDIATELY!"
     fi
 }
+
 
 run_pitr_from_position() {
     local start_binlog="$1"
@@ -1050,42 +1678,75 @@ run_pitr_from_position() {
     
     [[ -z "$MYSQLBINLOG" ]] && { warn "mysqlbinlog not available"; return 1; }
     
-    local binlog_dir="/var/lib/mysql"
+    # Try to read from binlog index first
+    local index="/var/lib/mysql/binlog.index"
     local binlogs=()
     
-    # Find all binlogs starting from start_binlog
-    local found=0
-    while IFS= read -r binlog; do
-        local binlog_name=$(basename "$binlog")
-        if [[ "$binlog_name" == "$start_binlog" ]]; then
-            found=1
-        fi
-        [[ $found -eq 1 ]] && binlogs+=("$binlog")
-    done < <(find "$binlog_dir" -name "*.0*" -type f | sort)
+    if [[ -r "$index" ]]; then
+        while IFS= read -r line; do
+            line="${line%\"}"; line="${line#\"}"
+            [[ -f "$line" ]] && binlogs+=("$line")
+        done < "$index"
+    else
+        warn "Binlog index not readable; falling back to glob"
+        mapfile -t binlogs < <(find /var/lib/mysql -name "*.0*" -type f 2>/dev/null | sort)
+    fi
     
-    [[ ${#binlogs[@]} -eq 0 ]] && { warn "No binlogs found"; return 1; }
+    [[ ${#binlogs[@]} -gt 0 ]] || { warn "No binlogs found"; return 1; }
     
-    log INFO "Applying ${#binlogs[@]} binlog file(s) for PITR"
-    
+    # Find starting binlog
+    local start_i=-1
     for i in "${!binlogs[@]}"; do
-        local binlog="${binlogs[$i]}"
+        if [[ "$(basename "${binlogs[$i]}")" == "$start_binlog" ]]; then
+            start_i="$i"
+            break
+        fi
+    done
+    
+    if (( start_i < 0 )); then
+        warn "Starting binlog not found: $start_binlog"
+        return 1
+    fi
+    
+    log INFO "Applying ${#binlogs[@]} binlog file(s) for PITR (starting at index $start_i)"
+    
+    local last_i=$((${#binlogs[@]} - 1))
+    
+    for i in $(seq "$start_i" "$last_i"); do
         local cmd=("$MYSQLBINLOG")
         
         # Start position only for first file
-        [[ $i -eq 0 ]] && cmd+=(--start-position="$start_pos")
+        if [[ $i -eq $start_i && -n "$start_pos" ]]; then
+            cmd+=(--start-position="$start_pos")
+        fi
         
         # Stop datetime for all files
-        cmd+=(--stop-datetime="$until_time")
-        cmd+=("$binlog")
+        [[ -n "$until_time" ]] && cmd+=(--stop-datetime="$until_time")
         
-        log INFO "Processing: $(basename "$binlog")"
-        "${cmd[@]}" | "$MYSQL" --login-path="$LOGIN_PATH" || warn "Error applying $binlog"
+        cmd+=("${binlogs[$i]}")
+        
+        log INFO "Processing: $(basename "${binlogs[$i]}")"
+        
+        if ! "${cmd[@]}" | "$MYSQL" --login-path="$LOGIN_PATH"; then
+            if [[ -n "$until_time" ]]; then
+                debug "Binlog replay stopped (likely reached target time)"
+                break
+            else
+                warn "Error applying ${binlogs[$i]}"
+            fi
+        fi
     done
     
     log INFO "✅ PITR complete"
 }
 
 backup_full() {
+
+    OPERATION_IN_PROGRESS="mysqldump-full"
+    
+    # Ensure mysqldump is available
+    [[ -n "$MYSQLDUMP" ]] || err "mysqldump not found; set BACKUP_METHOD=xtrabackup or install mysqldump"
+
     local ts="$(date +'%Y-%m-%d-%H-%M-%S')"
     local comp="$(compressor)"
     local ext="$(get_extension)"
@@ -1233,14 +1894,16 @@ OPTS
 
         # Drain: take all tokens back so we know all jobs finished.
         for _ in $(seq 1 "$PARALLEL_JOBS"); do
-          read -r -u 3 _
+            read -r -u 3 _
         done
 
         # close semaphore FD (also done by trap)
         exec 3>&- 3<&- || true
         stop_spinner
         
-        # Count results from status files
+        # Count results from status files more reliably
+        completed=0
+        errors=0
         for sf in "$status_dir"/job_*.status; do
             [[ -f "$sf" ]] || continue
             if grep -q "ok" "$sf" 2>/dev/null; then
@@ -1296,43 +1959,80 @@ backup_incremental() {
     
     local ts="$(date +'%Y-%m-%d-%H-%M-%S')"
     local comp="$(compressor)"
-    local ext="$(get_extension)"
+    local ext="$(get_binlog_extension)"
     
     log INFO "Starting incremental backup from $binlog_file:$binlog_pos"
     
-    local output="$BACKUP_DIR/incremental-${ts}.binlog.${ext}"
-    
-    # Adjust extension if encryption is on
+    local output="$BACKUP_DIR/incremental-${ts}.${ext}"
     [[ "$ENCRYPT_BACKUPS" == "1" ]] && output="${output}.enc"
-
-    if "$MYSQLBINLOG" --start-position="$binlog_pos" "/var/lib/mysql/${binlog_file}"* \
-      | $comp | encrypt_if_enabled > "$output"; then
-      create_checksum "$output"
-      log INFO "✅ Incremental backup created: $(basename "$output")"
-      add_summary "Incremental backup: $(basename "$output")"
-    else
-      err "Incremental backup failed"
+    
+    # Build list of binlogs from index
+    local index="/var/lib/mysql/binlog.index"
+    if [[ ! -r "$index" ]]; then
+        err "Binlog index not readable: $index (is binary logging enabled?)"
     fi
-
+    
+    # Read binlog list, stripping quotes
+    local binlogs=()
+    while IFS= read -r line; do
+        line="${line%\"}"; line="${line#\"}"
+        [[ -f "$line" ]] && binlogs+=("$line")
+    done < "$index"
+    
+    [[ ${#binlogs[@]} -gt 0 ]] || err "No binlogs listed in $index"
+    
+    # Find start index
+    local start_i=-1
+    for i in "${!binlogs[@]}"; do
+        if [[ "$(basename "${binlogs[$i]}")" == "$binlog_file" ]]; then
+            start_i="$i"
+            break
+        fi
+    done
+    
+    if (( start_i < 0 )); then
+        err "Start binlog $binlog_file not found in index"
+    fi
+    
+    log INFO "Capturing ${#binlogs[@]} binlog file(s) from position $start_i"
+    
+    {
+        "$MYSQLBINLOG" --start-position="$binlog_pos" "${binlogs[$start_i]}" || exit 1
+        
+        if (( start_i + 1 <= ${#binlogs[@]} - 1 )); then
+            "$MYSQLBINLOG" "${binlogs[@]:$((start_i+1))}" || exit 1
+        fi
+    } | $comp | encrypt_if_enabled > "$output" || err "Incremental backup failed"
+    
+    create_checksum "$output"
+    log INFO "✅ Incremental backup created: $(basename "$output")"
+    add_summary "Incremental backup: $(basename "$output")"
 }
+
 
 cleanup_old_backups() {
   # Age-based pruning for dumps, binlog bundles, and checksums
   [[ -d "$BACKUP_DIR" ]] || { log INFO "Backup dir not found: $BACKUP_DIR"; return 0; }
 
   log INFO "Pruning items older than ${RETENTION_DAYS} day(s)… (dry_run=$DRY_RUN)"
-  local f
+  
+  # More portable: two-pass approach
+  local files_to_delete=()
+  while IFS= read -r f; do
+    files_to_delete+=("$f")
+  done < <(find "$BACKUP_DIR" -maxdepth 1 -type f \
+            \( -name "*.sql.*" -o -name "*.binlog.*" -o -name "*.sha256" \) \
+            -mtime +"${RETENTION_DAYS}" 2>/dev/null)
+  
   if (( DRY_RUN == 1 )); then
-    while IFS= read -r f; do
+    for f in "${files_to_delete[@]}"; do
       log INFO "DRY-RUN: Would delete $(basename "$f")"
-    done < <(find "$BACKUP_DIR" -maxdepth 1 -type f \
-              \( -name "*.sql.*" -o -name "*.binlog.*" -o -name "*.sha256" \) \
-              -mtime +"${RETENTION_DAYS}" -print 2>/dev/null)
+    done
   else
-    # Print first for visibility, then delete
-    find "$BACKUP_DIR" -maxdepth 1 -type f \
-         \( -name "*.sql.*" -o -name "*.binlog.*" -o -name "*.sha256" \) \
-         -mtime +"${RETENTION_DAYS}" -print -delete 2>/dev/null || true
+    for f in "${files_to_delete[@]}"; do
+      log INFO "Deleting: $(basename "$f")"
+      rm -f "$f"
+    done
   fi
 }
 
@@ -1344,7 +2044,7 @@ verify() {
     require_login
     shopt -s nullglob
     
-    local files=("$BACKUP_DIR"/*.sql.* "$BACKUP_DIR"/*.binlog.*)
+    local files=("$BACKUP_DIR"/*.sql.* "$BACKUP_DIR"/*.binlog.* "$BACKUP_DIR"/*.tar.*)
     [[ ${#files[@]} -gt 0 ]] || { log INFO "No backups found in $BACKUP_DIR"; return 0; }
     
     log INFO "Verifying ${#files[@]} backup file(s)..."
@@ -1359,41 +2059,67 @@ verify() {
         show_progress "$idx" "${#files[@]}" "Verify"
         
         local base="$(basename "$f")"
-        
-        # Skip checksum and metadata files
         [[ "$base" =~ \.(sha256|meta)$ ]] && continue
         
-        # Verify checksum first
+        # Check checksum if present
         if ! verify_checksum "$f"; then
             ((warn_count++))
         fi
         
-        # Verify compression/encryption integrity
-        local decomp_cmd="$(decompressor "$f")"
-        if [[ "$f" =~ \.enc$ ]]; then
-          # decrypt → decompress to /dev/null (use stdin, not filename)
-          if decrypt_if_encrypted "$f" < "$f" | $decomp_cmd > /dev/null 2>&1; then
-            ((ok++)); debug "OK(enc): $base"
-          else
-            ((bad++)); warn "CORRUPT (enc): $base"; continue
-          fi
-        else
-          # direct decompress to /dev/null (use stdin, not filename)
-          if $decomp_cmd < "$f" > /dev/null 2>&1; then
-            ((ok++)); debug "OK: $base"
-          else
-            ((bad++)); warn "CORRUPT: $base"; continue
-          fi
+        # Tar bundles (xtrabackup): try listing
+        if [[ "$f" =~ \.tar(\.enc)?$ ]]; then
+            if [[ "$f" =~ \.enc$ ]]; then
+                if decrypt_if_encrypted "$f" < "$f" tar -tf - >/dev/null 2>&1; then
+                    ((ok++)); debug "OK(tar,enc): $base"
+                else
+                    ((bad++)); warn "CORRUPT (tar,enc): $base"; continue
+                fi
+            else
+                if tar -tf "$f" >/dev/null 2>&1; then
+                    ((ok++)); debug "OK(tar): $base"
+                else
+                    ((bad++)); warn "CORRUPT (tar): $base"; continue
+                fi
+            fi
+            continue
         fi
         
-        # Check for metadata
+        # Streamed (sql/binlog) bundles: decrypt → decompress to /dev/null
+        local decomp_cmd="$(decompressor "$f")"
+        if [[ "$f" =~ \.enc$ ]]; then
+            if decrypt_if_encrypted "$f" < "$f" | $decomp_cmd > /dev/null 2>&1; then
+                ((ok++)); debug "OK(enc): $base"
+            else
+                ((bad++)); warn "CORRUPT (enc): $base"; continue
+            fi
+        else
+            if $decomp_cmd < "$f" > /dev/null 2>&1; then
+                ((ok++)); debug "OK: $base"
+            else
+                ((bad++)); warn "CORRUPT: $base"; continue
+            fi
+        fi
+        
+        # Optional: quick header check for SQL dumps
+        if [[ "$base" == *.sql.* || "$base" == *.sql.*.enc ]]; then
+            local hdr_ok=0
+            if [[ "$f" =~ \.enc$ ]]; then
+                if decrypt_if_encrypted "$f" < "$f" | $decomp_cmd | head -n 50 | grep -q "^-- MySQL dump" 2>/dev/null; then
+                    hdr_ok=1
+                fi
+            else
+                if $decomp_cmd < "$f" | head -n 50 | grep -q "^-- MySQL dump" 2>/dev/null; then
+                    hdr_ok=1
+                fi
+            fi
+            (( hdr_ok == 1 )) || { ((warn_count++)); debug "Header check failed: $base"; }
+        fi
+        
+        # Metadata presence
         local ts="$(dump_ts_from_name "$base")"
         if [[ -n "$ts" ]]; then
             local meta="$BACKUP_DIR/backup-$ts.meta"
-            if [[ ! -f "$meta" ]]; then
-                ((warn_count++))
-                debug "Missing metadata: $base"
-            fi
+            [[ -f "$meta" ]] || { ((warn_count++)); debug "Missing metadata: $base"; }
         fi
     done
     
@@ -1409,11 +2135,14 @@ verify() {
     [[ "$ok" -gt 0 ]] && notify "Backup verification passed" "$ok file(s) verified successfully" "info"
 }
 
+
 # ========================== Restore Functions ==========================
 
 restore() {
     need_tooling
     require_login
+
+    acquire_lock 300 "restore"
     
     local arg1="${1:-}"
     local target_db_opt="${2:-}"
@@ -1493,13 +2222,14 @@ restore_file() {
     local target_db_opt="$2"
     local until_time="$3"
     local end_pos="$4"
-    
+
     log INFO "Restoring from file: $(basename "$file")"
-    
-    # Verify file
+
+    # Verify integrity quickly before doing any changes
     verify_checksum "$file" || warn "Checksum verification failed"
-    
-    local decomp_cmd="$(decompressor "$file")"
+
+    local decomp_cmd
+    decomp_cmd="$(decompressor "$file")"
     if [[ "$file" =~ \.enc$ ]]; then
       decrypt_if_encrypted "$file" < "$file" | $decomp_cmd >/dev/null 2>&1 \
         || err "Backup file appears corrupt (enc): $file"
@@ -1507,48 +2237,67 @@ restore_file() {
       $decomp_cmd < "$file" >/dev/null 2>&1 \
         || err "Backup file appears corrupt: $file"
     fi
-    
-    # Extract database name
-    local base="$(basename "$file")"
-    local src_db="${base%%-[0-9][0-9][0-9][0-9]-*}"
+
+    # Derive source DB from filename and pick destination
+    local base src_db dest_db dump_ts
+    base="$(basename "$file")"
+    src_db="${base%%-[0-9][0-9][0-9][0-9]-*}"
     [[ -n "$src_db" ]] || err "Cannot determine source database from filename"
-    
-    local dest_db="${target_db_opt:-$src_db}"
-    local dump_ts="$(dump_ts_from_name "$base")"
-    
+
+    dest_db="${target_db_opt:-$src_db}"
+    dump_ts="$(dump_ts_from_name "$base")"
+
     log INFO "Source DB: $src_db → Target DB: $dest_db"
-    
+
+    # Optional DROP safety
     if [[ "${DROP_FIRST:-0}" == "1" ]]; then
         warn "DROP_FIRST=1: Dropping database \`$dest_db\`"
         "$MYSQL" --login-path="$LOGIN_PATH" -e "DROP DATABASE IF EXISTS \`$dest_db\`;"
     fi
-    
-    "$MYSQL" --login-path="$LOGIN_PATH" -e "CREATE DATABASE IF NOT EXISTS \`$dest_db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
-    
+
+    # Always ensure DB exists with sane defaults
+    "$MYSQL" --login-path="$LOGIN_PATH" -e \
+      "CREATE DATABASE IF NOT EXISTS \`$dest_db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
+
+    # Build the import pipeline:
+    # decrypt → decompress → sanitize (neutralize DEFINER, disable binlog, relax FKs) → mysql
+    # If src == dest, use dump as-is; if renamed, strip CREATE/USE and target explicitly.
     if [[ "$dest_db" == "$src_db" ]]; then
-        decrypt_if_encrypted "$file" < "$file" | $decomp_cmd | "$MYSQL" --login-path="$LOGIN_PATH"
+        if [[ "$file" =~ \.enc$ ]]; then
+            decrypt_if_encrypted "$file" < "$file" \
+              | $decomp_cmd \
+              | sanitize_dump_stream \
+              | "$MYSQL" --login-path="$LOGIN_PATH"
+        else
+            $decomp_cmd < "$file" \
+              | sanitize_dump_stream \
+              | "$MYSQL" --login-path="$LOGIN_PATH"
+        fi
     else
         warn "Renaming database on restore: $src_db → $dest_db"
-        
-        # Escape special regex characters in database names
-        local src_escaped dest_escaped
-        src_escaped=$(printf '%s\n' "$src_db" | sed 's/[.[\*^$]/\\&/g')
-        dest_escaped=$(printf '%s\n' "$dest_db" | sed 's/[&/\]/\\&/g')
-        
-        decrypt_if_encrypted "$file" < "$file" | $decomp_cmd \
-            | sed -E \
-                -e "s/^(CREATE DATABASE[^;]*\`)${src_escaped}(\`)/\1${dest_escaped}\2/g" \
-                -e "s/^USE \`${src_escaped}\`/USE \`${dest_escaped}\`/g" \
-            | "$MYSQL" --login-path="$LOGIN_PATH"
+        if [[ "$file" =~ \.enc$ ]]; then
+            decrypt_if_encrypted "$file" < "$file" \
+              | $decomp_cmd \
+              | sed -E '/^CREATE DATABASE/d; /^USE `/d' \
+              | sanitize_dump_stream \
+              | "$MYSQL" --login-path="$LOGIN_PATH" -D "$dest_db"
+        else
+            $decomp_cmd < "$file" \
+              | sed -E '/^CREATE DATABASE/d; /^USE `/d' \
+              | sanitize_dump_stream \
+              | "$MYSQL" --login-path="$LOGIN_PATH" -D "$dest_db"
+        fi
     fi
-    
+
+    # Optional PITR after logical restore
     if [[ -n "$until_time" || -n "$end_pos" ]]; then
         run_pitr_local "$dest_db" "$until_time" "$end_pos" "$dump_ts"
     fi
-    
+
     log INFO "✅ Restore complete"
     add_summary "Restored: $dest_db"
 }
+
 
 restore_database() {
     local target="$1"
@@ -1658,7 +2407,11 @@ run_pitr_local() {
     fi
     
     log INFO "Applying PITR from $binlog_file"
-    [[ -n "$db_filter" ]] && log INFO "Database filter: $db_filter"
+    if [[ -n "$db_filter" ]]; then
+        log INFO "Database filter: $db_filter"
+        warn "PITR with --database filters cross-DB transactions; integrity depends on workload."
+    fi
+
     [[ -n "$until_time" ]] && log INFO "Until time: $until_time"
     [[ -n "$end_pos" ]] && log INFO "End position: $end_pos"
     
@@ -1787,9 +2540,18 @@ health() {
     
     # Last backup
     local last_backup
-    last_backup=$(find "$BACKUP_DIR" -name "*.sql.*" -type f ! -name "*.sha256" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2- || true)
+    last_backup=$(find "$BACKUP_DIR" -name "*.sql.*" -o -name "*.tar.*" -type f ! -name "*.sha256" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2- || true)
     if [[ -n "$last_backup" ]]; then
-        local age=$(( ($(date +%s) - $(stat -c %Y "$last_backup" 2>/dev/null || echo 0)) / 3600 ))
+        # BSD-safe stat
+        local last_mtime
+        if last_mtime=$(stat -c %Y "$last_backup" 2>/dev/null); then
+            :  # GNU stat succeeded
+        else
+            last_mtime=$(stat -f %m "$last_backup" 2>/dev/null || echo 0)
+        fi
+        
+        local age=$(( ($(date +%s) - last_mtime) / 3600 ))
+        
         if (( age < 48 )); then
             echo "✅ Last Backup: ${age}h ago ($(basename "$last_backup"))"
         else
@@ -1884,17 +2646,37 @@ tune() {
 
 maintain() {
     require_login
-    acquire_lock
-    
-    local mode="${1:-quick}"
-    
-    case "$mode" in
-        quick|full) ;;
-        *) err "Mode must be 'quick' or 'full'" ;;
-    esac
-    
-    log INFO "Running maintenance mode: $mode"
-    
+    acquire_lock 600 "maintenance"
+
+    local mode="quick"
+    local force=0 safe_flag=0
+    # args: maintain [quick|full] [--safe] [--force]
+    if [[ -n "${1:-}" ]]; then
+      case "$1" in
+        quick|full) mode="$1"; shift ;;
+      esac
+    fi
+    while [[ -n "${1:-}" ]]; do
+      case "$1" in
+        --safe) safe_flag=1 ;;
+        --force) force=1 ;;
+        *) warn "Unknown option to maintain: $1" ;;
+      esac
+      shift || true
+    done
+
+    # Decide if we should run safe mode
+    local use_safe=0
+    if (( safe_flag )); then
+      use_safe=1
+    elif (( force )); then
+      use_safe=0
+    elif should_safe_mode; then
+      use_safe=1
+    fi
+
+    log INFO "Running maintenance mode: $mode (safe=$use_safe, force=$force)"
+
     mapfile -t tables < <(
         "$MYSQL" --login-path="$LOGIN_PATH" -N -e "
             SELECT CONCAT(TABLE_SCHEMA,'.',TABLE_NAME)
@@ -1903,31 +2685,54 @@ maintain() {
               AND TABLE_TYPE='BASE TABLE'
             ORDER BY TABLE_SCHEMA, TABLE_NAME;"
     )
-    
+
     [[ ${#tables[@]} -gt 0 ]] || { log INFO "No tables found"; return 0; }
-    
+
+    # Always ANALYZE
     log INFO "Analyzing ${#tables[@]} table(s)..."
     local idx=0
-    
     for t in "${tables[@]}"; do
         ((idx++))
         show_progress "$idx" "${#tables[@]}" "ANALYZE"
-        "$MYSQL" --login-path="$LOGIN_PATH" -e "ANALYZE TABLE ${t};" >/dev/null 2>&1 || warn "Failed: $t"
+        "$MYSQL" --login-path="$LOGIN_PATH" -e "ANALYZE TABLE ${t};" >/dev/null 2>&1 || warn "ANALYZE failed: $t"
     done
-    
+
     if [[ "$mode" == "full" ]]; then
-        warn "OPTIMIZE mode: This may take a long time and require disk space"
-        idx=0
-        
-        for t in "${tables[@]}"; do
-            ((idx++))
-            show_progress "$idx" "${#tables[@]}" "OPTIMIZE"
-            "$MYSQL" --login-path="$LOGIN_PATH" -e "OPTIMIZE TABLE ${t};" >/dev/null 2>&1 || warn "Failed: $t"
-        done
+        if (( use_safe )); then
+            warn "SAFE mode active: skipping OPTIMIZE TABLE (risk conditions detected)"
+        else
+            # Optional: skip huge tables individually if space is marginal
+            local free_mb
+            free_mb=$(get_free_mb "/var/lib/mysql")
+            log INFO "Starting OPTIMIZE (free space: ${free_mb}MB)"
+            idx=0
+            for t in "${tables[@]}"; do
+                ((idx++))
+                show_progress "$idx" "${#tables[@]}" "OPTIMIZE"
+                # Check per-table size; skip if free space < ratio * table size
+                local tmb
+                tmb=$("$MYSQL" --login-path="$LOGIN_PATH" -N -e "
+                  SELECT COALESCE(ROUND((data_length+index_length)/1024/1024),0)
+                  FROM information_schema.TABLES
+                  WHERE CONCAT(TABLE_SCHEMA,'.',TABLE_NAME)='${t}';" 2>/dev/null | awk '{print int($1)}')
+                local need_mb
+                need_mb=$(python3 - <<PY 2>/dev/null || echo 0
+r = float("${SAFE_MIN_FREE_RATIO:-2.0}")
+print(int(round(r*${tmb:-0})))
+PY
+)
+                # If per-table check fails, skip that table
+                if (( free_mb > need_mb )); then
+                    "$MYSQL" --login-path="$LOGIN_PATH" -e "OPTIMIZE TABLE ${t};" >/dev/null 2>&1 || warn "OPTIMIZE failed: $t"
+                else
+                    warn "Skipping OPTIMIZE for ${t} (free ${free_mb}MB < need ${need_mb}MB)"
+                fi
+            done
+        fi
     fi
-    
+
     log INFO "✅ Maintenance complete"
-    add_summary "Maintenance ($mode): ${#tables[@]} tables processed"
+    add_summary "Maintenance (${mode}${use_safe:+,safe}): ${#tables[@]} tables processed"
 }
 
 # ========================== Cleanup ==========================
@@ -2090,9 +2895,6 @@ XTRABACKUP_COMPRESS_THREADS=4
 XTRABACKUP_MEMORY="1G"  # Memory for prepare phase
 
 # GFS Rotation
-KEEP_DAILY=7
-KEEP_WEEKLY=4
-KEEP_MONTHLY=6
 CLEAN_KEEP_MIN=2
 
 # Encryption (0=disabled, 1=enabled)
@@ -2198,10 +3000,62 @@ Version: 3.0.0
 EOF
 }
 
+# ========================== Status Check ==========================
+
+status() {
+    log INFO "=== DB Tools Status ==="
+    echo
+    
+    # Check if locked
+    if [[ -f "$LOCK_FILE" ]]; then
+        echo "🔒 Status: OPERATION IN PROGRESS"
+        local lock_info=$(cat "$LOCK_FILE")
+        echo "   $lock_info"
+        
+        # Check if process is still running
+        if [[ "$lock_info" =~ PID:([0-9]+) ]]; then
+            local pid="${BASH_REMATCH[1]}"
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "   ✅ Process $pid is running"
+            else
+                echo "   ⚠️  Process $pid is NOT running (stale lock?)"
+            fi
+        fi
+    else
+        echo "✅ Status: IDLE (no operations in progress)"
+    fi
+    
+    echo
+    echo "Recent backups:"
+    ls -lht "$BACKUP_DIR"/*.tar.* 2>/dev/null | head -5 || echo "  No backups found"
+    
+    echo
+    echo "Disk space:"
+    df -h "$BACKUP_DIR" | awk 'NR==1 || NR==2'
+    
+    echo
+    echo "MySQL status:"
+    if systemctl is-active --quiet mysql || systemctl is-active --quiet mariadb; then
+        echo "  ✅ MySQL is running"
+    else
+        echo "  ❌ MySQL is NOT running"
+    fi
+}
+
 # ========================== Main Dispatcher ==========================
 
 # Load configuration
 load_config
+
+# Auto-tune PARALLEL_JOBS if not set or invalid
+if ! [[ "${PARALLEL_JOBS:-}" =~ ^[1-9][0-9]*$ ]]; then
+  PARALLEL_JOBS="$(auto_parallel_jobs)"
+  debug "Auto-tuned PARALLEL_JOBS=$PARALLEL_JOBS"
+fi
+# Keep XTRABACKUP_PARALLEL/XTRABACKUP_COMPRESS_THREADS in sync if they still use defaults
+: "${XTRABACKUP_PARALLEL:=$PARALLEL_JOBS}"
+: "${XTRABACKUP_COMPRESS_THREADS:=$PARALLEL_JOBS}"
+
 
 # Create directories
 mkdir -p "$BACKUP_DIR" "$MARK_DIR" 2>/dev/null || true
@@ -2225,6 +3079,9 @@ case "$cmd" in
         ;;
     list)
         list_backups "$@"
+        ;;
+    status)
+        status "$@"
         ;;
     health)
         health "$@"
