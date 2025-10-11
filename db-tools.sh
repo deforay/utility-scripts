@@ -373,17 +373,38 @@ install_xtrabackup() {
         
         # Detect if MariaDB or MySQL
         if "$MYSQL" --version 2>/dev/null | grep -qi mariadb; then
+            log INFO "Detected MariaDB, installing mariadb-backup..."
             apt-get update -y >/dev/null 2>&1 || true
-            apt-get install -y mariadb-backup >/dev/null 2>&1
+            if apt-get install -y mariadb-backup 2>/dev/null; then
+                log INFO "✅ mariadb-backup installed"
+            else
+                warn "Failed to install mariadb-backup"
+                return 1
+            fi
         else
-            # Add Percona repository
-            wget -q https://repo.percona.com/apt/percona-release_latest.generic_all.deb -O /tmp/percona-release.deb 2>/dev/null || true
-            dpkg -i /tmp/percona-release.deb >/dev/null 2>&1 || true
-            rm -f /tmp/percona-release.deb
+            log INFO "Detected MySQL, installing percona-xtrabackup..."
+            # Try Percona repository
+            if ! have percona-release; then
+                wget -q https://repo.percona.com/apt/percona-release_latest.generic_all.deb -O /tmp/percona-release.deb 2>/dev/null || {
+                    warn "Cannot download percona-release"
+                    return 1
+                }
+                dpkg -i /tmp/percona-release.deb >/dev/null 2>&1 || true
+                rm -f /tmp/percona-release.deb
+            fi
+            
             percona-release enable-only tools release >/dev/null 2>&1 || true
             apt-get update -y >/dev/null 2>&1 || true
-            apt-get install -y percona-xtrabackup-80 >/dev/null 2>&1 || \
-            apt-get install -y percona-xtrabackup-24 >/dev/null 2>&1
+            
+            # Try different versions
+            if apt-get install -y percona-xtrabackup-80 2>/dev/null; then
+                log INFO "✅ percona-xtrabackup-80 installed"
+            elif apt-get install -y percona-xtrabackup-24 2>/dev/null; then
+                log INFO "✅ percona-xtrabackup-24 installed"
+            else
+                warn "Failed to install percona-xtrabackup"
+                return 1
+            fi
         fi
     elif have yum; then
         if "$MYSQL" --version 2>/dev/null | grep -qi mariadb; then
@@ -404,12 +425,21 @@ install_xtrabackup() {
             dnf -y install percona-xtrabackup-24 >/dev/null 2>&1
         fi
     else
+        warn "Unsupported package manager"
         return 1
     fi
     
     # Update path
     XTRABACKUP="$(command -v xtrabackup || command -v mariabackup || true)"
-    [[ -n "$XTRABACKUP" ]] && log INFO "✅ XtraBackup installed: $XTRABACKUP" || return 1
+    if [[ -n "$XTRABACKUP" ]]; then
+        log INFO "✅ XtraBackup installed at: $XTRABACKUP"
+        # Update backup method
+        BACKUP_METHOD="xtrabackup"
+        return 0
+    else
+        warn "XtraBackup installation completed but binary not found"
+        return 1
+    fi
 }
 
 install_package() {
@@ -618,15 +648,20 @@ init() {
     if have apt-get; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -y >/dev/null 2>&1 || true
-        apt-get install -y percona-toolkit mysqltuner mailutils >/dev/null 2>&1 || warn "Some tools failed to install"
+        apt-get install -y percona-toolkit mysqltuner mailutils qpress >/dev/null 2>&1 || warn "Some tools failed to install"
     elif have yum; then
-        yum -y install percona-toolkit mysqltuner mailx >/dev/null 2>&1 || warn "Some tools failed to install"
+        yum -y install percona-toolkit mysqltuner mailx qpress >/dev/null 2>&1 || warn "Some tools failed to install"
     fi
-
-    # Install XtraBackup if needed
-    if [[ "$BACKUP_METHOD" == "xtrabackup" ]] && [[ -z "$XTRABACKUP" ]]; then
-        install_xtrabackup || warn "XtraBackup installation failed, will use mysqldump"
-    fi    
+    
+    # *** ADD THIS SECTION ***
+    log INFO "Installing XtraBackup..."
+    if install_xtrabackup; then
+        log INFO "✅ XtraBackup installation successful"
+    else
+        warn "XtraBackup installation failed - will use mysqldump instead"
+        BACKUP_METHOD="mysqldump"
+    fi
+    # *** END NEW SECTION ***
     
     ensure_compression_tools
     check_key_perms
