@@ -291,10 +291,18 @@ need_tooling() {
     [[ -n "$MYSQLDUMP" ]] || warn "mysqldump not found (logical backups will be unavailable)"
     [[ -n "$MYSQLBINLOG" ]] || warn "mysqlbinlog not found (PITR will be limited)"
     
+    # Auto-install XtraBackup if backup method is xtrabackup and it's not found
     if [[ "$BACKUP_METHOD" == "xtrabackup" ]]; then
         if [[ -z "$XTRABACKUP" ]]; then
-            warn "xtrabackup/mariabackup not found, falling back to mysqldump"
-            BACKUP_METHOD="mysqldump"
+            log INFO "XtraBackup not found, attempting auto-install..."
+            if install_xtrabackup; then
+                log INFO "✅ XtraBackup auto-installed successfully"
+                # Update the path after installation
+                XTRABACKUP="$(command -v xtrabackup || command -v mariabackup || true)"
+            else
+                warn "XtraBackup auto-install failed, falling back to mysqldump"
+                BACKUP_METHOD="mysqldump"
+            fi
         else
             debug "Using XtraBackup at: $XTRABACKUP"
         fi
@@ -625,7 +633,7 @@ estimate_backup_size() {
 # ========================== Initialization ==========================
 
 init() {
-    need_tooling
+    need_tooling  # ← This will auto-install XtraBackup!
     log INFO "Initializing db-tools with login-path '$LOGIN_PATH'..."
     
     have mysql_config_editor || err "mysql_config_editor not found"
@@ -652,16 +660,6 @@ init() {
     elif have yum; then
         yum -y install percona-toolkit mysqltuner mailx qpress >/dev/null 2>&1 || warn "Some tools failed to install"
     fi
-    
-    # *** ADD THIS SECTION ***
-    log INFO "Installing XtraBackup..."
-    if install_xtrabackup; then
-        log INFO "✅ XtraBackup installation successful"
-    else
-        warn "XtraBackup installation failed - will use mysqldump instead"
-        BACKUP_METHOD="mysqldump"
-    fi
-    # *** END NEW SECTION ***
     
     ensure_compression_tools
     check_key_perms
