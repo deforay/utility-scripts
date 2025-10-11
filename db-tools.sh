@@ -30,7 +30,7 @@ MARK_DIR="/var/lib/dbtools"
 MARK_INIT="$MARK_DIR/init.stamp"
 LOCK_FILE="/var/run/db-tools.lock"
 if [[ ! -w "$(dirname "$LOCK_FILE")" ]]; then
-  LOCK_FILE="/tmp/db-tools.lock"
+    LOCK_FILE="/tmp/db-tools.lock"
 fi
 
 # Compression settings
@@ -66,6 +66,15 @@ CHECKSUM_ENABLED="${CHECKSUM_ENABLED:-1}"
 MYSQL="${MYSQL:-$(command -v mysql || true)}"
 MYSQLDUMP="${MYSQLDUMP:-$(command -v mysqldump || true)}"
 MYSQLBINLOG="${MYSQLBINLOG:-$(command -v mysqlbinlog || true)}"
+
+# XtraBackup settings
+XTRABACKUP_ENABLED="${XTRABACKUP_ENABLED:-1}"
+XTRABACKUP_PARALLEL="${XTRABACKUP_PARALLEL:-$PARALLEL_JOBS}"
+XTRABACKUP_COMPRESS="${XTRABACKUP_COMPRESS:-1}"
+XTRABACKUP_COMPRESS_THREADS="${XTRABACKUP_COMPRESS_THREADS:-$PARALLEL_JOBS}"
+XTRABACKUP_MEMORY="${XTRABACKUP_MEMORY:-1G}"  # Memory for prepare phase
+BACKUP_METHOD="${BACKUP_METHOD:-xtrabackup}"  # xtrabackup or mysqldump
+XTRABACKUP="${XTRABACKUP:-$(command -v xtrabackup || command -v mariabackup || true)}"
 
 # Global state
 declare -g BACKUP_SUMMARY=()
@@ -279,8 +288,17 @@ load_config() {
 
 need_tooling() {
     [[ -n "$MYSQL" ]]     || err "mysql client not found"
-    [[ -n "$MYSQLDUMP" ]] || err "mysqldump not found"
+    [[ -n "$MYSQLDUMP" ]] || warn "mysqldump not found (logical backups will be unavailable)"
     [[ -n "$MYSQLBINLOG" ]] || warn "mysqlbinlog not found (PITR will be limited)"
+    
+    if [[ "$BACKUP_METHOD" == "xtrabackup" ]]; then
+        if [[ -z "$XTRABACKUP" ]]; then
+            warn "xtrabackup/mariabackup not found, falling back to mysqldump"
+            BACKUP_METHOD="mysqldump"
+        else
+            debug "Using XtraBackup at: $XTRABACKUP"
+        fi
+    fi
 }
 
 ensure_compression_tools() {
@@ -345,7 +363,54 @@ check_key_perms() {
   debug "Encryption key permissions validated"
 }
 
-
+install_xtrabackup() {
+    [[ "$EUID" -ne 0 ]] && { warn "Cannot auto-install without root"; return 1; }
+    
+    log INFO "Installing XtraBackup/MariaBackup..."
+    
+    if have apt-get; then
+        export DEBIAN_FRONTEND=noninteractive
+        
+        # Detect if MariaDB or MySQL
+        if "$MYSQL" --version 2>/dev/null | grep -qi mariadb; then
+            apt-get update -y >/dev/null 2>&1 || true
+            apt-get install -y mariadb-backup >/dev/null 2>&1
+        else
+            # Add Percona repository
+            wget -q https://repo.percona.com/apt/percona-release_latest.generic_all.deb -O /tmp/percona-release.deb 2>/dev/null || true
+            dpkg -i /tmp/percona-release.deb >/dev/null 2>&1 || true
+            rm -f /tmp/percona-release.deb
+            percona-release enable-only tools release >/dev/null 2>&1 || true
+            apt-get update -y >/dev/null 2>&1 || true
+            apt-get install -y percona-xtrabackup-80 >/dev/null 2>&1 || \
+            apt-get install -y percona-xtrabackup-24 >/dev/null 2>&1
+        fi
+    elif have yum; then
+        if "$MYSQL" --version 2>/dev/null | grep -qi mariadb; then
+            yum -y install MariaDB-backup >/dev/null 2>&1
+        else
+            yum install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm >/dev/null 2>&1 || true
+            percona-release enable-only tools release >/dev/null 2>&1 || true
+            yum -y install percona-xtrabackup-80 >/dev/null 2>&1 || \
+            yum -y install percona-xtrabackup-24 >/dev/null 2>&1
+        fi
+    elif have dnf; then
+        if "$MYSQL" --version 2>/dev/null | grep -qi mariadb; then
+            dnf -y install MariaDB-backup >/dev/null 2>&1
+        else
+            dnf install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm >/dev/null 2>&1 || true
+            percona-release enable-only tools release >/dev/null 2>&1 || true
+            dnf -y install percona-xtrabackup-80 >/dev/null 2>&1 || \
+            dnf -y install percona-xtrabackup-24 >/dev/null 2>&1
+        fi
+    else
+        return 1
+    fi
+    
+    # Update path
+    XTRABACKUP="$(command -v xtrabackup || command -v mariabackup || true)"
+    [[ -n "$XTRABACKUP" ]] && log INFO "✅ XtraBackup installed: $XTRABACKUP" || return 1
+}
 
 install_package() {
     local pkg="$1"
@@ -557,6 +622,11 @@ init() {
     elif have yum; then
         yum -y install percona-toolkit mysqltuner mailx >/dev/null 2>&1 || warn "Some tools failed to install"
     fi
+
+    # Install XtraBackup if needed
+    if [[ "$BACKUP_METHOD" == "xtrabackup" ]] && [[ -z "$XTRABACKUP" ]]; then
+        install_xtrabackup || warn "XtraBackup installation failed, will use mysqldump"
+    fi    
     
     ensure_compression_tools
     check_key_perms
@@ -583,10 +653,403 @@ backup() {
     check_disk_space "$BACKUP_DIR" "$estimated_size"
     
     case "$backup_type" in
-        full) backup_full ;;
-        incremental) backup_incremental ;;
-        *) err "Unknown backup type: $backup_type (use: full, incremental)" ;;
+        full)
+            if [[ "$BACKUP_METHOD" == "xtrabackup" && -n "$XTRABACKUP" ]]; then
+                backup_xtra_full
+            else
+                backup_full
+            fi
+            ;;
+        incremental)
+            if [[ "$BACKUP_METHOD" == "xtrabackup" && -n "$XTRABACKUP" ]]; then
+                backup_xtra_incremental
+            else
+                backup_incremental
+            fi
+            ;;
+        logical)
+            backup_full
+            ;;
+        *)
+            err "Unknown backup type: $backup_type (use: full, incremental, logical)"
+            ;;
     esac
+}
+
+backup_xtra_full() {
+    local ts="$(date +'%Y-%m-%d-%H-%M-%S')"
+    local backup_dir="$BACKUP_DIR/xtra-full-$ts"
+    
+    log INFO "Starting XtraBackup full backup..."
+    
+    # Cleanup old backups first
+    cleanup_old_backups
+    
+    mkdir -p "$backup_dir"
+    
+    # Build xtrabackup command
+    local xtra_cmd=("$XTRABACKUP" --backup --target-dir="$backup_dir")
+    xtra_cmd+=(--parallel="$XTRABACKUP_PARALLEL")
+    
+    # Add compression if enabled
+    if [[ "$XTRABACKUP_COMPRESS" == "1" ]]; then
+        case "$COMPRESS_ALGO" in
+            zstd)
+                if have zstd; then
+                    xtra_cmd+=(--compress=zstd)
+                    xtra_cmd+=(--compress-threads="$XTRABACKUP_COMPRESS_THREADS")
+                fi
+                ;;
+            *)
+                # XtraBackup has built-in qpress compression
+                if have qpress; then
+                    xtra_cmd+=(--compress)
+                    xtra_cmd+=(--compress-threads="$XTRABACKUP_COMPRESS_THREADS")
+                fi
+                ;;
+        esac
+    fi
+    
+    # Get MySQL credentials from login-path
+    local mysql_user mysql_pass mysql_host mysql_port
+    mysql_host=$(mysql_config_editor print --login-path="$LOGIN_PATH" 2>/dev/null | grep host | cut -d= -f2 | tr -d ' ')
+    mysql_port=$(mysql_config_editor print --login-path="$LOGIN_PATH" 2>/dev/null | grep port | cut -d= -f2 | tr -d ' ')
+    mysql_user=$(mysql_config_editor print --login-path="$LOGIN_PATH" 2>/dev/null | grep user | cut -d= -f2 | tr -d ' ')
+    
+    [[ -n "$mysql_host" ]] && xtra_cmd+=(--host="$mysql_host")
+    [[ -n "$mysql_port" ]] && xtra_cmd+=(--port="$mysql_port")
+    [[ -n "$mysql_user" ]] && xtra_cmd+=(--user="$mysql_user")
+    
+    # Run backup
+    log INFO "Executing: ${xtra_cmd[*]}"
+    
+    if "${xtra_cmd[@]}" 2>"$backup_dir/xtrabackup.log"; then
+        # Save metadata
+        {
+            echo "timestamp=$ts"
+            echo "backup_type=xtrabackup-full"
+            echo "backup_method=xtrabackup"
+            echo "xtrabackup_version=$($XTRABACKUP --version 2>&1 | head -1)"
+            echo "server_version=$("$MYSQL" --login-path="$LOGIN_PATH" -N -e 'SELECT VERSION();')"
+            
+            # Extract LSN from xtrabackup_checkpoints
+            if [[ -f "$backup_dir/xtrabackup_checkpoints" ]]; then
+                grep "^to_lsn" "$backup_dir/xtrabackup_checkpoints" >> "$BACKUP_DIR/backup-$ts.meta"
+            fi
+            
+            # Get binlog position
+            if [[ -f "$backup_dir/xtrabackup_binlog_info" ]]; then
+                local binlog_info
+                binlog_info=$(cat "$backup_dir/xtrabackup_binlog_info")
+                echo "binlog_file=$(echo "$binlog_info" | awk '{print $1}')" 
+                echo "binlog_pos=$(echo "$binlog_info" | awk '{print $2}')"
+            fi
+        } > "$BACKUP_DIR/backup-$ts.meta"
+        
+        # Encrypt if enabled
+        if [[ "$ENCRYPT_BACKUPS" == "1" ]]; then
+            log INFO "Encrypting backup..."
+            tar -cf - -C "$BACKUP_DIR" "xtra-full-$ts" | \
+                encrypt_if_enabled > "$BACKUP_DIR/xtra-full-$ts.tar.enc"
+            rm -rf "$backup_dir"
+            backup_dir="$BACKUP_DIR/xtra-full-$ts.tar.enc"
+        else
+            # Tar it for easier management
+            tar -czf "$BACKUP_DIR/xtra-full-$ts.tar.gz" -C "$BACKUP_DIR" "xtra-full-$ts"
+            rm -rf "$backup_dir"
+            backup_dir="$BACKUP_DIR/xtra-full-$ts.tar.gz"
+        fi
+        
+        # Create checksum
+        create_checksum "$backup_dir"
+        
+        log INFO "✅ XtraBackup full backup complete: $(basename "$backup_dir")"
+        add_summary "XtraBackup full backup: $(basename "$backup_dir")"
+        notify "Backup completed successfully" "XtraBackup full backup completed" "info"
+        return 0
+    else
+        err "XtraBackup full backup failed. Check $backup_dir/xtrabackup.log"
+    fi
+}
+
+backup_xtra_incremental() {
+    local ts="$(date +'%Y-%m-%d-%H-%M-%S')"
+    
+    # Find base backup
+    local base_backup
+    base_backup=$(find "$BACKUP_DIR" -maxdepth 1 \( -name "xtra-full-*.tar.gz" -o -name "xtra-full-*.tar.enc" \) 2>/dev/null | sort -r | head -1)
+    
+    if [[ -z "$base_backup" ]]; then
+        warn "No full XtraBackup found, creating full backup instead"
+        backup_xtra_full
+        return
+    fi
+    
+    log INFO "Starting XtraBackup incremental backup..."
+    
+    # Extract base backup to temp location
+    local temp_base="$BACKUP_DIR/.xtra_base_$$"
+    mkdir -p "$temp_base"
+    stack_trap "rm -rf '$temp_base'" EXIT
+    
+    if [[ "$base_backup" =~ \.enc$ ]]; then
+        decrypt_if_encrypted "$base_backup" < "$base_backup" | tar -xzf - -C "$temp_base"
+    else
+        tar -xzf "$base_backup" -C "$temp_base"
+    fi
+    
+    local base_dir=$(find "$temp_base" -maxdepth 1 -type d -name "xtra-full-*" | head -1)
+    [[ -z "$base_dir" ]] && err "Cannot find extracted base backup"
+    
+    local backup_dir="$BACKUP_DIR/xtra-incr-$ts"
+    mkdir -p "$backup_dir"
+    
+    # Build incremental command
+    local xtra_cmd=("$XTRABACKUP" --backup)
+    xtra_cmd+=(--target-dir="$backup_dir")
+    xtra_cmd+=(--incremental-basedir="$base_dir")
+    xtra_cmd+=(--parallel="$XTRABACKUP_PARALLEL")
+    
+    # Add compression
+    if [[ "$XTRABACKUP_COMPRESS" == "1" ]] && have qpress; then
+        xtra_cmd+=(--compress)
+        xtra_cmd+=(--compress-threads="$XTRABACKUP_COMPRESS_THREADS")
+    fi
+    
+    # Get credentials
+    local mysql_user mysql_host mysql_port
+    mysql_host=$(mysql_config_editor print --login-path="$LOGIN_PATH" 2>/dev/null | grep host | cut -d= -f2 | tr -d ' ')
+    mysql_port=$(mysql_config_editor print --login-path="$LOGIN_PATH" 2>/dev/null | grep port | cut -d= -f2 | tr -d ' ')
+    mysql_user=$(mysql_config_editor print --login-path="$LOGIN_PATH" 2>/dev/null | grep user | cut -d= -f2 | tr -d ' ')
+    
+    [[ -n "$mysql_host" ]] && xtra_cmd+=(--host="$mysql_host")
+    [[ -n "$mysql_port" ]] && xtra_cmd+=(--port="$mysql_port")
+    [[ -n "$mysql_user" ]] && xtra_cmd+=(--user="$mysql_user")
+    
+    if "${xtra_cmd[@]}" 2>"$backup_dir/xtrabackup.log"; then
+        # Save metadata
+        {
+            echo "timestamp=$ts"
+            echo "backup_type=xtrabackup-incremental"
+            echo "backup_method=xtrabackup"
+            echo "base_backup=$(basename "$base_backup")"
+            
+            if [[ -f "$backup_dir/xtrabackup_checkpoints" ]]; then
+                grep "^to_lsn" "$backup_dir/xtrabackup_checkpoints"
+            fi
+        } > "$BACKUP_DIR/backup-$ts.meta"
+        
+        # Package incremental
+        if [[ "$ENCRYPT_BACKUPS" == "1" ]]; then
+            tar -cf - -C "$BACKUP_DIR" "xtra-incr-$ts" | \
+                encrypt_if_enabled > "$BACKUP_DIR/xtra-incr-$ts.tar.enc"
+            rm -rf "$backup_dir"
+            backup_dir="$BACKUP_DIR/xtra-incr-$ts.tar.enc"
+        else
+            tar -czf "$BACKUP_DIR/xtra-incr-$ts.tar.gz" -C "$BACKUP_DIR" "xtra-incr-$ts"
+            rm -rf "$backup_dir"
+            backup_dir="$BACKUP_DIR/xtra-incr-$ts.tar.gz"
+        fi
+        
+        create_checksum "$backup_dir"
+        
+        log INFO "✅ XtraBackup incremental backup complete: $(basename "$backup_dir")"
+        add_summary "XtraBackup incremental backup: $(basename "$backup_dir")"
+        notify "Incremental backup completed" "XtraBackup incremental backup completed" "info"
+    else
+        err "XtraBackup incremental backup failed"
+    fi
+}
+
+restore_xtra() {
+    local backup_file="$1"
+    local target_db="${2:-}"
+    local until_time="${3:-}"
+    
+    log INFO "Restoring from XtraBackup: $(basename "$backup_file")"
+    
+    # Verify checksum
+    verify_checksum "$backup_file" || warn "Checksum verification failed"
+    
+    # Extract backup
+    local temp_restore="$BACKUP_DIR/.xtra_restore_$$"
+    mkdir -p "$temp_restore"
+    stack_trap "rm -rf '$temp_restore'" EXIT
+    
+    log INFO "Extracting backup..."
+    if [[ "$backup_file" =~ \.enc$ ]]; then
+        decrypt_if_encrypted "$backup_file" < "$backup_file" | tar -xzf - -C "$temp_restore"
+    else
+        tar -xzf "$backup_file" -C "$temp_restore"
+    fi
+    
+    local backup_dir=$(find "$temp_restore" -maxdepth 1 -type d -name "xtra-*" | head -1)
+    [[ -z "$backup_dir" ]] && err "Cannot find extracted backup"
+    
+    # Decompress if needed
+    if [[ -f "$backup_dir/xtrabackup_checkpoints" ]]; then
+        if grep -q "compressed = 1" "$backup_dir/xtrabackup_checkpoints" 2>/dev/null; then
+            log INFO "Decompressing backup..."
+            "$XTRABACKUP" --decompress --target-dir="$backup_dir" \
+                --parallel="$XTRABACKUP_PARALLEL" || err "Decompression failed"
+            
+            # Remove .qp files
+            find "$backup_dir" -name "*.qp" -delete
+        fi
+    fi
+    
+    # Apply incrementals if any
+    local base_ts
+    base_ts=$(basename "$backup_file" | grep -oP '\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}')
+    
+    local incrementals=()
+    while IFS= read -r incr; do
+        incrementals+=("$incr")
+    done < <(find "$BACKUP_DIR" -name "xtra-incr-*.tar.*" 2>/dev/null | sort)
+    
+    if [[ ${#incrementals[@]} -gt 0 ]]; then
+        log INFO "Found ${#incrementals[@]} incremental backup(s) to apply"
+        
+        # First prepare base with --apply-log-only
+        log INFO "Preparing base backup..."
+        "$XTRABACKUP" --prepare --apply-log-only \
+            --target-dir="$backup_dir" \
+            --use-memory="$XTRABACKUP_MEMORY" || err "Base prepare failed"
+        
+        # Apply each incremental
+        for incr in "${incrementals[@]}"; do
+            log INFO "Applying incremental: $(basename "$incr")"
+            
+            local temp_incr="$temp_restore/incr_$$"
+            mkdir -p "$temp_incr"
+            
+            if [[ "$incr" =~ \.enc$ ]]; then
+                decrypt_if_encrypted "$incr" < "$incr" | tar -xzf - -C "$temp_incr"
+            else
+                tar -xzf "$incr" -C "$temp_incr"
+            fi
+            
+            local incr_dir=$(find "$temp_incr" -maxdepth 1 -type d -name "xtra-incr-*" | head -1)
+            
+            # Decompress incremental if needed
+            if [[ -f "$incr_dir/xtrabackup_checkpoints" ]]; then
+                if grep -q "compressed = 1" "$incr_dir/xtrabackup_checkpoints" 2>/dev/null; then
+                    "$XTRABACKUP" --decompress --target-dir="$incr_dir" \
+                        --parallel="$XTRABACKUP_PARALLEL"
+                    find "$incr_dir" -name "*.qp" -delete
+                fi
+            fi
+            
+            "$XTRABACKUP" --prepare --apply-log-only \
+                --target-dir="$backup_dir" \
+                --incremental-dir="$incr_dir" \
+                --use-memory="$XTRABACKUP_MEMORY" || err "Incremental apply failed"
+            
+            rm -rf "$temp_incr"
+        done
+    fi
+    
+    # Final prepare
+    log INFO "Final prepare..."
+    "$XTRABACKUP" --prepare \
+        --target-dir="$backup_dir" \
+        --use-memory="$XTRABACKUP_MEMORY" || err "Final prepare failed"
+    
+    # Stop MySQL
+    log INFO "Stopping MySQL..."
+    if systemctl is-active --quiet mysql; then
+        systemctl stop mysql || systemctl stop mysqld || err "Cannot stop MySQL"
+    elif systemctl is-active --quiet mariadb; then
+        systemctl stop mariadb || err "Cannot stop MariaDB"
+    else
+        err "MySQL/MariaDB service not found"
+    fi
+    
+    # Backup current datadir
+    local datadir="/var/lib/mysql"
+    local backup_old="$datadir.backup.$(date +%s)"
+    log INFO "Backing up current datadir to $backup_old"
+    mv "$datadir" "$backup_old" || err "Cannot backup current datadir"
+    mkdir -p "$datadir"
+    
+    # Copy back
+    log INFO "Copying backup to datadir..."
+    "$XTRABACKUP" --copy-back --target-dir="$backup_dir" || {
+        log ERROR "Copy-back failed, restoring original datadir"
+        rm -rf "$datadir"
+        mv "$backup_old" "$datadir"
+        err "Restore failed"
+    }
+    
+    # Fix permissions
+    chown -R mysql:mysql "$datadir" || chown -R mysql:mysql "$datadir"
+    
+    # Start MySQL
+    log INFO "Starting MySQL..."
+    if systemctl start mysql || systemctl start mysqld || systemctl start mariadb; then
+        log INFO "✅ XtraBackup restore complete"
+        
+        # PITR if requested
+        if [[ -n "$until_time" ]]; then
+            # Extract binlog info from backup
+            if [[ -f "$backup_dir/xtrabackup_binlog_info" ]]; then
+                local binlog_file binlog_pos
+                binlog_file=$(awk '{print $1}' "$backup_dir/xtrabackup_binlog_info")
+                binlog_pos=$(awk '{print $2}' "$backup_dir/xtrabackup_binlog_info")
+                
+                log INFO "Applying binlogs from $binlog_file:$binlog_pos to $until_time"
+                
+                # Apply binlogs
+                run_pitr_from_position "$binlog_file" "$binlog_pos" "$until_time"
+            fi
+        fi
+        
+        add_summary "XtraBackup restore: Success"
+    else
+        err "Cannot start MySQL after restore"
+    fi
+}
+
+run_pitr_from_position() {
+    local start_binlog="$1"
+    local start_pos="$2"
+    local until_time="$3"
+    
+    [[ -z "$MYSQLBINLOG" ]] && { warn "mysqlbinlog not available"; return 1; }
+    
+    local binlog_dir="/var/lib/mysql"
+    local binlogs=()
+    
+    # Find all binlogs starting from start_binlog
+    local found=0
+    while IFS= read -r binlog; do
+        local binlog_name=$(basename "$binlog")
+        if [[ "$binlog_name" == "$start_binlog" ]]; then
+            found=1
+        fi
+        [[ $found -eq 1 ]] && binlogs+=("$binlog")
+    done < <(find "$binlog_dir" -name "*.0*" -type f | sort)
+    
+    [[ ${#binlogs[@]} -eq 0 ]] && { warn "No binlogs found"; return 1; }
+    
+    log INFO "Applying ${#binlogs[@]} binlog file(s) for PITR"
+    
+    for i in "${!binlogs[@]}"; do
+        local binlog="${binlogs[$i]}"
+        local cmd=("$MYSQLBINLOG")
+        
+        # Start position only for first file
+        [[ $i -eq 0 ]] && cmd+=(--start-position="$start_pos")
+        
+        # Stop datetime for all files
+        cmd+=(--stop-datetime="$until_time")
+        cmd+=("$binlog")
+        
+        log INFO "Processing: $(basename "$binlog")"
+        "${cmd[@]}" | "$MYSQL" --login-path="$LOGIN_PATH" || warn "Error applying $binlog"
+    done
+    
+    log INFO "✅ PITR complete"
 }
 
 backup_full() {
@@ -944,42 +1407,52 @@ restore() {
         cat <<EOF
 Usage:
   $0 restore <DB|ALL>
-  $0 restore /path/to/backup.sql.gz [target-db]
+  $0 restore /path/to/backup.tar.gz [target-db]
   
 Optional PITR environment variables:
   UNTIL_TIME='YYYY-MM-DD HH:MM:SS'  - Replay binlogs until this timestamp
   END_POS=<position>                - Stop at this binlog position
   
 Examples:
-  # Basic restore
+  # Basic restore (auto-detects backup type)
   $0 restore mydb
   
-  # Restore all databases
-  $0 restore ALL
+  # Restore XtraBackup
+  $0 restore /var/backups/mysql/xtra-full-2025-01-15-10-00-00.tar.gz
+  
+  # Restore mysqldump with rename
+  $0 restore /path/to/mydb-backup.sql.gz test_database
   
   # Point-in-time restore
   UNTIL_TIME='2025-01-15 10:30:00' $0 restore mydb
-  
-  # Restore from specific file
-  $0 restore /var/backups/mysql/mydb-2025-01-15-10-00-00.sql.gz
-  
-  # Restore with rename
-  $0 restore /path/to/prod-backup.sql.gz test_database
-  
-  # Drop and recreate before restore
-  DROP_FIRST=1 $0 restore mydb
 EOF
         exit 1
     fi
     
     # Handle file-based restore
     if [[ -f "$arg1" ]]; then
-        restore_file "$arg1" "$target_db_opt" "$until_time" "$end_pos"
+        # Auto-detect backup type
+        if [[ "$arg1" =~ xtra-(full|incr) ]]; then
+            restore_xtra "$arg1" "$target_db_opt" "$until_time"
+        else
+            restore_file "$arg1" "$target_db_opt" "$until_time" "$end_pos"
+        fi
         return
     fi
     
-    # Handle DB name or ALL
-    restore_database "$arg1" "$until_time" "$end_pos"
+    # Handle DB name or ALL - find latest backup
+    if [[ "$arg1" == "ALL" || ! -f "$arg1" ]]; then
+        # Try XtraBackup first
+        local xtra_backup=$(find "$BACKUP_DIR" -name "xtra-full-*.tar.*" 2>/dev/null | sort -r | head -1)
+        if [[ -n "$xtra_backup" && -n "$XTRABACKUP" ]]; then
+            log INFO "Found XtraBackup: $(basename "$xtra_backup")"
+            restore_xtra "$xtra_backup" "" "$until_time"
+        else
+            # Fallback to mysqldump
+            restore_database "$arg1" "$until_time" "$end_pos"
+        fi
+        return
+    fi
 }
 
 restore_file() {
@@ -1310,6 +1783,15 @@ health() {
     else
         echo "⚠️  Compression: Using gzip (slower)"
     fi
+
+    # XtraBackup
+    if [[ -n "$XTRABACKUP" ]]; then
+        local xtra_version
+        xtra_version=$("$XTRABACKUP" --version 2>&1 | head -1 | awk '{print $3}' || echo "unknown")
+        echo "✅ XtraBackup: Installed ($xtra_version)"
+    else
+        echo "⚠️  XtraBackup: Not installed (physical backups unavailable)"
+    fi    
     
     # Checksums
     if [[ "$CHECKSUM_ENABLED" == "1" ]] && have sha256sum; then
@@ -1566,6 +2048,14 @@ PARALLEL_JOBS=2
 COMPRESS_ALGO="pigz"
 COMPRESS_LEVEL=6
 
+# XtraBackup (physical backups - faster for InnoDB)
+BACKUP_METHOD="xtrabackup"  # xtrabackup or mysqldump
+XTRABACKUP_ENABLED=1
+XTRABACKUP_PARALLEL=4
+XTRABACKUP_COMPRESS=1
+XTRABACKUP_COMPRESS_THREADS=4
+XTRABACKUP_MEMORY="1G"  # Memory for prepare phase
+
 # GFS Rotation
 KEEP_DAILY=7
 KEEP_WEEKLY=4
@@ -1609,10 +2099,10 @@ Usage: $0 <command> [options]
 
 Commands:
   init                          Initialize login credentials and tools
-  backup [full|incremental]     Create database backup (default: full)
+  backup [full|incremental]     Create backup (XtraBackup by default)
+  backup logical                Create logical backup (mysqldump)
   verify                        Verify backup integrity with checksums
-  restore <DB|ALL|file>         Restore database or backup file
-  restore <file> [target-db]    Restore with optional database rename
+  restore <DB|ALL|file>         Restore (auto-detects backup type)
   list                          List all available backups
   
   health                        Run system health check
