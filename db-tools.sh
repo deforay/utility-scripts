@@ -99,6 +99,22 @@ SAFE_PEAK_HOURS="${SAFE_PEAK_HOURS:-8-20}"
 MAINT_SAFE_AUTO="${MAINT_SAFE_AUTO:-1}"
 
 # --- helpers ---
+
+
+
+# Stack new commands onto an existing trap on a signal (default EXIT)
+stack_trap() {
+  local new_cmd="$1" sig="${2:-EXIT}"
+  local old_cmd
+  old_cmd="$(trap -p "$sig" | sed -E "s/.*'(.+)'/\1/")"
+  if [[ -n "$old_cmd" && "$old_cmd" != "trap -- '' $sig" ]]; then
+    trap "$old_cmd; $new_cmd" "$sig"
+  else
+    trap "$new_cmd" "$sig"
+  fi
+}
+
+
 get_free_mb() {
   # Arg: path; prints integer MB free (0 on error)
   local p="${1:-/var/lib/mysql}"
@@ -662,19 +678,6 @@ ensure_compression_tools() {
             ;;
     esac
 }
-
-# Stack new commands onto an existing trap on a signal (default EXIT)
-stack_trap() {
-  local new_cmd="$1" sig="${2:-EXIT}"
-  local old_cmd
-  old_cmd="$(trap -p "$sig" | sed -E "s/.*'(.+)'/\1/")"
-  if [[ -n "$old_cmd" && "$old_cmd" != "trap -- '' $sig" ]]; then
-    trap "$old_cmd; $new_cmd" "$sig"
-  else
-    trap "$new_cmd" "$sig"
-  fi
-}
-
 check_key_perms() {
   [[ "$ENCRYPT_BACKUPS" == "1" && -n "$ENCRYPTION_KEY_FILE" ]] || return 0
 
