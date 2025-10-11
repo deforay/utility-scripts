@@ -55,7 +55,7 @@ NOTIFY_WEBHOOK="${NOTIFY_WEBHOOK:-}"
 NOTIFY_ON="${NOTIFY_ON:-error}"  # always, error, never
 
 # Auto-install behavior
-AUTO_INSTALL="${AUTO_INSTALL:-0}"  # Set to 1 to enable auto-installation of tools
+AUTO_INSTALL="${AUTO_INSTALL:-1}"  # Set to 1 to enable auto-installation of tools
 
 # Logging
 LOG_LEVEL="${LOG_LEVEL:-INFO}"  # DEBUG, INFO, WARN, ERROR
