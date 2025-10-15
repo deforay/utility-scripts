@@ -321,4 +321,3 @@ echo
 echo
 echo "Installation complete! PHP ${PHP_VERSION} is now active."
 echo
-echo
