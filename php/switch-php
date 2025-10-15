@@ -108,8 +108,8 @@ install_extension() {
     if ! php -m | grep -qi '^redis$' || [ "$FORCE_MODE" = true ]; then
       echo "Installing php-redis from PPA..."
       if ! apt-get install -y $APT_PPA_TARGET php-redis; then
-        echo "Failed to install php-redis" >>/var/log/php-switch-error.log
-        return 1
+        echo "⚠ Failed to install php-redis" >>/var/log/php-switch-error.log
+        return 0
       fi
     fi
     echo "✓ redis loaded/installed"
@@ -130,13 +130,14 @@ install_extension() {
 
   # sqlite3 may be missing for some PHP/Ubuntu combos on focal
   if [ "$ext_name" = "sqlite3" ]; then
-    echo "✗ ${pkg} not available from PPA on this release" | tee -a /var/log/php-switch-error.log
+    echo "⚠ ${pkg} not available from PPA on this release" | tee -a /var/log/php-switch-error.log
     echo "  → Consider PHP 8.3 on focal (php8.3-sqlite3) or upgrade to Ubuntu 22.04/24.04." | tee -a /var/log/php-switch-error.log
-    return 1
+    echo "  → Continuing installation without sqlite3..." | tee -a /var/log/php-switch-error.log
+    return 0
   fi
 
-  echo "✗ Could not install ${pkg}" | tee -a /var/log/php-switch-error.log
-  return 1
+  echo "⚠ Could not install ${pkg}" | tee -a /var/log/php-switch-error.log
+  return 0
 }
 
 # Core extensions (keep names that actually exist)
@@ -174,7 +175,7 @@ done
 
 # Imagick (unversioned in PPA)
 echo "Installing php-imagick (PPA)…"
-apt-get install -y $APT_PPA_TARGET php-imagick || echo "php-imagick failed" >>/var/log/php-switch-error.log
+apt-get install -y $APT_PPA_TARGET php-imagick || echo "⚠ php-imagick failed" >>/var/log/php-switch-error.log
 
 # Apache module switch
 echo "Configuring Apache for PHP ${PHP_VERSION}..."
@@ -295,7 +296,7 @@ if php -m | grep -qi '^sqlite3$'; then
         }
     " 2>/dev/null || true
 else
-    echo "✗ sqlite3 extension not loaded"
+    echo "⚠ sqlite3 extension not loaded"
     echo "  → Install php${PHP_VERSION}-sqlite3 (if available) or use PHP 8.3 on focal / upgrade to 22.04+."
 fi
 

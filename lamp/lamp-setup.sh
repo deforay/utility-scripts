@@ -153,7 +153,7 @@ setup_system() {
     # Check if basic packages are already installed
     print info "Checking and installing basic packages..."
     local packages_to_install=()
-    local basic_packages=(build-essential software-properties-common gnupg apt-transport-https ca-certificates lsb-release wget vim zip unzip curl acl snapd rsync git gdebi net-tools sed mawk magic-wormhole openssh-server libsodium-dev mosh aria2 certbot python3-certbot-apache)
+    local basic_packages=(build-essential software-properties-common gnupg apt-transport-https ca-certificates lsb-release wget vim zip unzip curl acl snapd rsync git gdebi net-tools sed mawk magic-wormhole openssh-server libsodium-dev mosh aria2 wget lsb-release bc pigz gpg certbot python3-certbot-apache)
 
     for package in "${basic_packages[@]}"; do
         if ! dpkg -l | grep -q "^ii  $package "; then
