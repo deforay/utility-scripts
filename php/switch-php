@@ -35,32 +35,68 @@ check_ubuntu_version
 if [ $# -lt 1 ]; then
   echo "Provide PHP version (e.g., 7.4, 8.0, 8.1, 8.2, 8.3)"
   echo "Options:"
-  echo "  -f, --force    Force reinstall PHP, extensions, and Composer"
+  echo "  -f, --force         Force reinstall PHP, extensions, and Composer"
+  echo "      --fast          Skip apt upgrade/base package install/optional extensions"
+  echo "      --no-optional   Skip optional extensions (apcu, memcached, redis)"
+  echo "      --no-upgrade    Skip apt-get upgrade/autoremove step"
+  echo "      --skip-base     Skip base dependency install"
   exit 1
 fi
 
 PHP_VERSION="$1"
-FORCE_MODE=false
+shift
 
-# Check for force flag
-if [ $# -ge 2 ]; then
-  if [ "$2" = "-f" ] || [ "$2" = "--force" ]; then
-    FORCE_MODE=true
-    echo "Force mode enabled: will reinstall PHP, extensions, and Composer"
-  fi
-fi
+FORCE_MODE=false
+FAST_MODE=false
+SKIP_OPTIONAL_EXT=false
+SKIP_UPGRADE=false
+SKIP_BASE_PACKAGES=false
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -f|--force)
+      FORCE_MODE=true
+      echo "Force mode enabled: will reinstall PHP, extensions, and Composer"
+      ;;
+    --fast)
+      FAST_MODE=true
+      SKIP_OPTIONAL_EXT=true
+      SKIP_UPGRADE=true
+      SKIP_BASE_PACKAGES=true
+      echo "Fast mode enabled: skipping system upgrade, base packages, and optional extensions"
+      ;;
+    --no-optional)
+      SKIP_OPTIONAL_EXT=true
+      ;;
+    --no-upgrade)
+      SKIP_UPGRADE=true
+      ;;
+    --skip-base)
+      SKIP_BASE_PACKAGES=true
+      ;;
+    *)
+      echo "Unknown option: $1"
+      exit 1
+      ;;
+  esac
+  shift
+done
 
 # Refresh base packages
 apt-get update
-apt-get -y upgrade
-apt-get -y autoremove
+if [ "$SKIP_UPGRADE" = false ]; then
+  apt-get -y upgrade
+  apt-get -y autoremove
+fi
 dpkg --configure -a
 
-apt-get install -y \
-  build-essential software-properties-common gnupg apt-transport-https \
-  ca-certificates lsb-release wget vim zip unzip curl acl snapd rsync git \
-  gdebi net-tools sed mawk magic-wormhole openssh-server libsodium-dev \
-  mosh aria2 imagemagick
+if [ "$SKIP_BASE_PACKAGES" = false ]; then
+  apt-get install -y --no-install-recommends \
+    build-essential software-properties-common gnupg apt-transport-https \
+    ca-certificates lsb-release wget vim zip unzip curl acl snapd rsync git \
+    gdebi net-tools sed mawk magic-wormhole openssh-server libsodium-dev \
+    mosh aria2 imagemagick
+fi
 
 # Add Ondřej's PPAs (idempotent) and update
 echo "Adding Ondřej repositories..."
@@ -204,9 +240,13 @@ for ext in "${extensions[@]}"; do
 done
 
 echo "Installing optional PHP extensions..."
-for ext in "${optional_extensions[@]}"; do
-  install_extension "$ext" || true
-done
+if [ "$SKIP_OPTIONAL_EXT" = false ]; then
+  for ext in "${optional_extensions[@]}"; do
+    install_extension "$ext" || true
+  done
+else
+  echo "Skipping optional extensions (apcu, memcached, redis)"
+fi
 
 # Imagick (unversioned in PPA)
 echo "Installing php-imagick (PPA)…"
