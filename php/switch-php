@@ -45,6 +45,7 @@ if [ $# -lt 1 ]; then
   echo "      --no-optional   Skip optional extensions (apcu, memcached, redis)"
   echo "      --no-upgrade    Skip apt-get upgrade/autoremove step"
   echo "      --skip-base     Skip base dependency install"
+  echo "      --no-composer-update  Skip Composer self-update to the latest v2 release"
   exit 1
 fi
 
@@ -56,6 +57,7 @@ FAST_MODE=false
 SKIP_OPTIONAL_EXT=false
 SKIP_UPGRADE=false
 SKIP_BASE_PACKAGES=false
+UPDATE_COMPOSER=true
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -78,6 +80,9 @@ while [ $# -gt 0 ]; do
       ;;
     --skip-base)
       SKIP_BASE_PACKAGES=true
+      ;;
+    --no-composer-update)
+      UPDATE_COMPOSER=false
       ;;
     *)
       echo "Unknown option: $1"
@@ -103,10 +108,19 @@ if [ "$SKIP_BASE_PACKAGES" = false ]; then
     mosh aria2 imagemagick
 fi
 
+ensure_ppa() {
+  local ppa="$1" pattern="$2"
+  if ls /etc/apt/sources.list.d/${pattern} >/dev/null 2>&1; then
+    echo "✓ ${ppa} already present"
+    return 0
+  fi
+  echo "Adding ${ppa}..."
+  LC_ALL=C.UTF-8 add-apt-repository -y "${ppa}" || true
+}
+
 # Add Ondřej's PPAs (idempotent) and update
-echo "Adding Ondřej repositories..."
-LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php || true
-LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/apache2 || true
+ensure_ppa "ppa:ondrej/php" "ondrej-ubuntu-php*"
+ensure_ppa "ppa:ondrej/apache2" "ondrej-ubuntu-apache2*"
 apt-get update
 
 # Verify PPA presence
