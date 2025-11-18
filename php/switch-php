@@ -88,16 +88,50 @@ apt-get update
 # Force apt to pick from the PPA when available
 APT_PPA_TARGET="-t o=LP-PPA-ondrej-php"
 
-# Ensure base PHP + Apache module
-if ! command -v "php${PHP_VERSION}" >/dev/null 2>&1 || [ "$FORCE_MODE" = true ]; then
-  echo "Installing PHP ${PHP_VERSION}..."
-  apt-get install -y $APT_PPA_TARGET "php${PHP_VERSION}" "libapache2-mod-php${PHP_VERSION}"
-else
-  echo "PHP ${PHP_VERSION} is already installed."
-fi
-
 # Helpers
 package_exists() { apt-cache show "$1" >/dev/null 2>&1; }
+
+install_with_fallback() {
+  local pkg="$1" label="${2:-$1}" allow_missing="${3:-false}"
+  if apt-get install -y $APT_PPA_TARGET "$pkg"; then
+    echo "✓ Installed ${label}"
+    return 0
+  fi
+
+  echo "⚠ ${label} install via PPA target failed, retrying without pin" | tee -a /var/log/php-switch-error.log
+  if apt-get install -y "$pkg"; then
+    echo "✓ Installed ${label}"
+    return 0
+  fi
+
+  if [ "$allow_missing" = true ]; then
+    echo "⚠ ${label} not available; continuing" | tee -a /var/log/php-switch-error.log
+    return 0
+  fi
+
+  echo "✗ Failed to install ${label}" | tee -a /var/log/php-switch-error.log
+  return 1
+}
+
+ensure_package_installed() {
+  local pkg="$1" label="${2:-$1}"
+  if [ "$FORCE_MODE" = false ] && dpkg -s "$pkg" >/dev/null 2>&1; then
+    echo "✓ ${label} already installed"
+    return 0
+  fi
+
+  echo "Installing ${label}..."
+  install_with_fallback "$pkg" "$label"
+}
+
+# Ensure base PHP + Apache module
+ensure_package_installed "php${PHP_VERSION}" "PHP ${PHP_VERSION}"
+apache_module_pkg="libapache2-mod-php${PHP_VERSION}"
+if package_exists "$apache_module_pkg"; then
+  ensure_package_installed "$apache_module_pkg" "$apache_module_pkg" || true
+else
+  echo "⚠ ${apache_module_pkg} not available from repositories" | tee -a /var/log/php-switch-error.log
+fi
 
 install_extension() {
   local ext_name="$1"
@@ -123,9 +157,10 @@ install_extension() {
   fi
 
   echo "Installing ${pkg}..."
-  if package_exists "${pkg}" && apt-get install -y $APT_PPA_TARGET "${pkg}"; then
-    echo "✓ Installed ${pkg}"
-    return 0
+  if package_exists "${pkg}"; then
+    if install_with_fallback "${pkg}" "${pkg}"; then
+      return 0
+    fi
   fi
 
   # sqlite3 may be missing for some PHP/Ubuntu combos on focal
@@ -179,15 +214,24 @@ apt-get install -y $APT_PPA_TARGET php-imagick || echo "⚠ php-imagick failed" 
 
 # Apache module switch
 echo "Configuring Apache for PHP ${PHP_VERSION}..."
-enabled_php_versions=$(ls /etc/apache2/mods-enabled/ 2>/dev/null | grep -oP '^php\d\.\d' | sort -u || true)
-for ev in $enabled_php_versions; do
-    if [ "$ev" != "php${PHP_VERSION}" ]; then
-        echo "Disabling $ev"
-        a2dismod "$ev" || true
+if [ -x /usr/sbin/a2enmod ] && [ -d /etc/apache2 ]; then
+    enabled_php_versions=$(ls /etc/apache2/mods-enabled/ 2>/dev/null | grep -oP '^php\d\.\d' | sort -u || true)
+    for ev in $enabled_php_versions; do
+        if [ "$ev" != "php${PHP_VERSION}" ]; then
+            echo "Disabling $ev"
+            a2dismod "$ev" || true
+        fi
+    done
+
+    if [ -f "/etc/apache2/mods-available/php${PHP_VERSION}.load" ]; then
+        echo "Enabling php${PHP_VERSION} module"
+        a2enmod "php${PHP_VERSION}" || echo "⚠ Failed to enable php${PHP_VERSION} module" | tee -a /var/log/php-switch-error.log
+    else
+        echo "⚠ Apache module php${PHP_VERSION} not found; skipping enable" | tee -a /var/log/php-switch-error.log
     fi
-done
-echo "Enabling php${PHP_VERSION} module"
-a2enmod "php${PHP_VERSION}" || true
+else
+    echo "⚠ Apache2 not detected; skipping Apache module configuration" | tee -a /var/log/php-switch-error.log
+fi
 
 # CLI alternatives
 echo "Setting PHP ${PHP_VERSION} as default CLI..."
@@ -241,20 +285,47 @@ for phpini in "/etc/php/${PHP_VERSION}/apache2/php.ini" "/etc/php/${PHP_VERSION}
         }' "$phpini" >"${phpini}.tmp" && mv "${phpini}.tmp" "$phpini"
 done
 
+# Composer (global, verified)
+install_composer_global() {
+    echo "Installing Composer (verified)…"
+    local installer sig actual
+    sig="$(curl -fsSL https://composer.github.io/installer.sig)" || {
+        echo "Failed to fetch Composer installer signature."
+        return 1
+    }
+    installer="$(mktemp)"
+    curl -fsSL https://getcomposer.org/installer -o "$installer" || {
+        echo "Failed to download Composer installer."
+        rm -f "$installer"
+        return 1
+    }
+    actual="$(php -r "echo hash_file('sha384', '${installer}');")"
+    if [ "$sig" != "$actual" ]; then
+        echo "Composer installer signature mismatch. Aborting."
+        rm -f "$installer"
+        return 1
+    fi
+    php "$installer" --no-ansi --quiet --install-dir=/usr/local/bin --filename=composer || {
+        echo "Composer installation failed."
+        rm -f "$installer"
+        return 1
+    }
+    rm -f "$installer"
+    chmod 755 /usr/local/bin/composer
+    # Ensure cron/systemd (often lacking /usr/local/bin) can find it:
+    if [ -w /usr/bin ] && [ ! -e /usr/bin/composer ]; then
+        ln -sf /usr/local/bin/composer /usr/bin/composer
+    fi
+    echo "✓ Composer installed at $(/usr/local/bin/composer -V 2>/dev/null || echo /usr/local/bin/composer)"
+}
+
 # Composer
 if [ "$FORCE_MODE" = true ] || ! command -v composer >/dev/null 2>&1; then
-    echo "Installing Composer..."
-    # Remove existing composer if force mode
+    echo "Setting up Composer (force=${FORCE_MODE})…"
     if [ "$FORCE_MODE" = true ] && [ -f /usr/local/bin/composer ]; then
-        echo "Removing existing Composer (force mode)..."
         rm -f /usr/local/bin/composer
     fi
-    curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
-    if command -v composer >/dev/null 2>&1; then
-        echo "✓ Composer installed successfully"
-    else
-        echo "⚠ Composer installation may have failed"
-    fi
+    install_composer_global || echo "⚠ Composer setup encountered an issue"
 else
     echo "✓ Composer already installed (use --force to reinstall)"
 fi
@@ -262,51 +333,6 @@ fi
 # Final restart
 echo "Final Apache restart..."
 service apache2 restart
-
-# Report
-echo
-echo "PHP SWITCH INSTALLATION REPORT"
-echo "------------------------------"
-echo "PHP Version: $(php --version | head -n1)"
-echo "Apache Module: $(apache2ctl -M 2>/dev/null | grep php || echo 'Not found')"
-if command -v composer >/dev/null 2>&1; then
-    echo "Composer Version: $(composer --version 2>/dev/null | head -n1)"
-fi
-echo
-echo "Loaded Extensions:"
-php -m | grep -E "(sqlite|pdo|mysql|redis|curl|gd|zip|json|xml)" | sort || true
-
-echo
-echo "SQLite Support Check:"
-if php -m | grep -qi '^sqlite3$'; then
-    echo "✓ sqlite3 extension is loaded"
-    php -r "
-        if (class_exists('SQLite3')) {
-        echo \"✓ SQLite3 class is available\n\";
-        echo '  Version: ' . SQLite3::version()['versionString'] . \"\n\";
-        }
-        if (class_exists('PDO')) {
-        \$drivers = PDO::getAvailableDrivers();
-        if (in_array('sqlite', \$drivers)) {
-            echo \"✓ SQLite PDO driver is available\n\";
-        } else {
-            echo \"✗ SQLite PDO driver is NOT available\n\";
-        }
-        echo '  Available PDO drivers: ' . implode(', ', \$drivers) . \"\n\";
-        }
-    " 2>/dev/null || true
-else
-    echo "⚠ sqlite3 extension not loaded"
-    echo "  → Install php${PHP_VERSION}-sqlite3 (if available) or use PHP 8.3 on focal / upgrade to 22.04+."
-fi
-
-echo
-echo "Redis Support Check:"
-if php -r "exit(class_exists('Redis') ? 0 : 1);" 2>/dev/null; then
-    echo "✓ Redis extension is loaded"
-else
-    echo "⚠ Redis extension not loaded"
-fi
 
 echo
 if [ -f /var/log/php-switch-error.log ]; then
