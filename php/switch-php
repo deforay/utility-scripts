@@ -31,6 +31,11 @@ check_ubuntu_version() {
 }
 check_ubuntu_version
 
+# Fresh log for this run
+LOG_FILE="/var/log/php-switch-error.log"
+echo "PHP switch run $(date -Is)" > "$LOG_FILE"
+chmod 0644 "$LOG_FILE" || true
+
 # Parse arguments
 if [ $# -lt 1 ]; then
   echo "Provide PHP version (e.g., 7.4, 8.0, 8.1, 8.2, 8.3)"
