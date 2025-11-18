@@ -378,6 +378,17 @@ install_composer_global() {
     echo "✓ Composer installed at $(/usr/local/bin/composer -V 2>/dev/null || echo /usr/local/bin/composer)"
 }
 
+update_composer_major2() {
+    [ "$UPDATE_COMPOSER" = true ] || return 0
+    command -v composer >/dev/null 2>&1 || return 0
+    echo "Updating Composer to latest v2…"
+    if composer self-update --2 >/dev/null 2>&1; then
+        echo "✓ Composer now $((composer --version 2>/dev/null) || echo 'updated'))"
+    else
+        echo "⚠ Composer self-update failed" | tee -a "$LOG_FILE"
+    fi
+}
+
 # Composer
 if [ "$FORCE_MODE" = true ] || ! command -v composer >/dev/null 2>&1; then
     echo "Setting up Composer (force=${FORCE_MODE})…"
@@ -388,6 +399,7 @@ if [ "$FORCE_MODE" = true ] || ! command -v composer >/dev/null 2>&1; then
 else
     echo "✓ Composer already installed (use --force to reinstall)"
 fi
+update_composer_major2
 
 # Final restart
 echo "Final Apache restart..."
