@@ -33,7 +33,7 @@ check_ubuntu_version
 
 # Fresh log for this run
 LOG_FILE="/var/log/php-switch-error.log"
-echo "PHP switch run $(date -Is)" > "$LOG_FILE"
+# echo "PHP switch run $(date -Is)" > "$LOG_FILE"
 chmod 0644 "$LOG_FILE" || true
 
 # Parse arguments
@@ -44,6 +44,7 @@ if [ $# -lt 1 ]; then
   echo "      --fast          Skip apt upgrade/base package install/optional extensions"
   echo "      --no-optional   Skip optional extensions (apcu, memcached, redis)"
   echo "      --no-upgrade    Skip apt-get upgrade/autoremove step"
+  echo "      --no-update     Skip apt-get update (useful on air-gapped/slow hosts)"
   echo "      --skip-base     Skip base dependency install"
   echo "      --no-composer-update  Skip Composer self-update to the latest v2 release"
   exit 1
@@ -58,6 +59,8 @@ SKIP_OPTIONAL_EXT=false
 SKIP_UPGRADE=false
 SKIP_BASE_PACKAGES=false
 UPDATE_COMPOSER=true
+RUN_APT_UPDATE=true
+APT_UPDATED=false
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -70,7 +73,8 @@ while [ $# -gt 0 ]; do
       SKIP_OPTIONAL_EXT=true
       SKIP_UPGRADE=true
       SKIP_BASE_PACKAGES=true
-      echo "Fast mode enabled: skipping system upgrade, base packages, and optional extensions"
+      RUN_APT_UPDATE=false
+      echo "Fast mode enabled: skipping apt-get update/upgrade, base packages, and optional extensions"
       ;;
     --no-optional)
       SKIP_OPTIONAL_EXT=true
@@ -80,6 +84,9 @@ while [ $# -gt 0 ]; do
       ;;
     --skip-base)
       SKIP_BASE_PACKAGES=true
+      ;;
+    --no-update)
+      RUN_APT_UPDATE=false
       ;;
     --no-composer-update)
       UPDATE_COMPOSER=false
@@ -92,8 +99,30 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+apt_update() {
+  local force="${1:-false}"
+  if [ "$RUN_APT_UPDATE" = false ]; then
+    echo "Skipping apt-get update (--fast/--no-update)"
+    return 0
+  fi
+  if [ "$force" != "true" ] && [ "$APT_UPDATED" = "true" ]; then
+    return 0
+  fi
+  apt-get update
+  APT_UPDATED=true
+}
+
+restart_apache() {
+  echo "Restarting Apache..."
+  if timeout 20 service apache2 restart; then
+    return 0
+  fi
+  echo "⚠ Apache restart timed out or failed; attempting systemctl restart" | tee -a "$LOG_FILE"
+  timeout 20 systemctl restart apache2 || echo "⚠ systemctl restart apache2 also failed" | tee -a "$LOG_FILE"
+}
+
 # Refresh base packages
-apt-get update
+apt_update
 if [ "$SKIP_UPGRADE" = false ]; then
   apt-get -y upgrade
   apt-get -y autoremove
@@ -121,7 +150,7 @@ ensure_ppa() {
 # Add Ondřej's PPAs (idempotent) and update
 ensure_ppa "ppa:ondrej/php" "ondrej-ubuntu-php*"
 ensure_ppa "ppa:ondrej/apache2" "ondrej-ubuntu-apache2*"
-apt-get update
+apt_update true
 
 # Verify PPA presence
 if ! ls /etc/apt/sources.list.d/ondrej-ubuntu-php* >/dev/null 2>&1; then
@@ -138,7 +167,7 @@ Package: apache2*
 Pin: release o=LP-PPA-ondrej-apache2
 Pin-Priority: 700
 EOF
-apt-get update
+apt_update true
 
 # Force apt to pick from the PPA when available
 APT_PPA_TARGET="-t o=LP-PPA-ondrej-php"
@@ -182,10 +211,12 @@ ensure_package_installed() {
 # Ensure base PHP + Apache module
 ensure_package_installed "php${PHP_VERSION}" "PHP ${PHP_VERSION}"
 apache_module_pkg="libapache2-mod-php${PHP_VERSION}"
-if package_exists "$apache_module_pkg"; then
-  ensure_package_installed "$apache_module_pkg" "$apache_module_pkg" || true
-else
-  echo "⚠ ${apache_module_pkg} not available from repositories" | tee -a /var/log/php-switch-error.log
+if ! ensure_package_installed "$apache_module_pkg" "$apache_module_pkg"; then
+  echo "⚠ ${apache_module_pkg} install failed; checking availability..." | tee -a /var/log/php-switch-error.log
+  if ! package_exists "$apache_module_pkg"; then
+    echo "⚠ ${apache_module_pkg} not found in apt cache (PPA may not have this version yet)" | tee -a /var/log/php-switch-error.log
+  fi
+  apt-cache policy "$apache_module_pkg" >>/var/log/php-switch-error.log 2>&1 || true
 fi
 
 install_extension() {
@@ -287,19 +318,24 @@ if [ -x /usr/sbin/a2enmod ] && [ -d /etc/apache2 ]; then
         fi
     done
 
-    if [ -f "/etc/apache2/mods-available/php${PHP_VERSION}.load" ]; then
+    mod_load_file="/etc/apache2/mods-available/php${PHP_VERSION}.load"
+    if [ ! -f "$mod_load_file" ]; then
+        echo "⚠ Apache module php${PHP_VERSION} not found; reinstalling apache module package..."
+        # Reinstall explicitly in case dpkg database thinks it's already present
+        if ! apt-get install -y --reinstall $APT_PPA_TARGET "libapache2-mod-php${PHP_VERSION}"; then
+            echo "⚠ Reinstall via PPA pin failed, retrying without pin" | tee -a "$LOG_FILE"
+            apt-get install -y --reinstall "libapache2-mod-php${PHP_VERSION}" || true
+        fi
+        apt-cache policy "libapache2-mod-php${PHP_VERSION}" >>"$LOG_FILE" 2>&1 || true
+    fi
+
+    if [ -f "$mod_load_file" ]; then
         echo "Enabling php${PHP_VERSION} module"
         if ! a2enmod "php${PHP_VERSION}"; then
             echo "⚠ Failed to enable php${PHP_VERSION} module" | tee -a "$LOG_FILE"
         fi
     else
-        echo "⚠ Apache module php${PHP_VERSION} not found; reinstalling apache module package..."
-        ensure_package_installed "libapache2-mod-php${PHP_VERSION}" "libapache2-mod-php${PHP_VERSION}" || true
-        if [ -f "/etc/apache2/mods-available/php${PHP_VERSION}.load" ]; then
-            a2enmod "php${PHP_VERSION}" || echo "⚠ Failed to enable php${PHP_VERSION} module" | tee -a "$LOG_FILE"
-        else
-            echo "⚠ Apache module php${PHP_VERSION} still missing after reinstall" | tee -a "$LOG_FILE"
-        fi
+        echo "⚠ Apache module php${PHP_VERSION} still missing after reinstall" | tee -a "$LOG_FILE"
     fi
 else
     echo "⚠ Apache2 not detected; skipping Apache module configuration" | tee -a "$LOG_FILE"
@@ -317,8 +353,7 @@ if [ -f "$CLI_PHP_INI" ] && ! grep -q "apc.enable_cli=1" "$CLI_PHP_INI"; then
     echo "apc.enable_cli=1" >>"$CLI_PHP_INI"
 fi
 
-echo "Restarting Apache..."
-service apache2 restart
+restart_apache || true
 
 echo "✓ Switched to PHP ${PHP_VERSION}"
 echo "✓ PHP CLI version switched"
@@ -358,6 +393,8 @@ for phpini in "/etc/php/${PHP_VERSION}/apache2/php.ini" "/etc/php/${PHP_VERSION}
 done
 
 # Composer (global, verified)
+COMPOSER_TIMEOUT=60
+
 install_composer_global() {
     echo "Installing Composer (verified)…"
     local installer sig actual
@@ -395,10 +432,31 @@ update_composer_major2() {
     [ "$UPDATE_COMPOSER" = true ] || return 0
     command -v composer >/dev/null 2>&1 || return 0
     echo "Updating Composer to latest v2…"
-    if composer self-update --2 >/dev/null 2>&1; then
+    
+    # Set environment variables to suppress interactive warnings
+    export COMPOSER_ALLOW_SUPERUSER=1
+    export COMPOSER_NO_INTERACTION=1
+    
+    # Add verbose output to show progress and prevent hanging on prompts
+    if timeout "$COMPOSER_TIMEOUT" composer self-update --2 --no-interaction --quiet 2>&1; then
         echo "✓ Composer now $(composer --version 2>/dev/null || echo 'updated')"
+        return 0
+    fi
+    
+    local exit_code=$?
+    if [ $exit_code -eq 124 ]; then
+        echo "⚠ Composer self-update timed out after ${COMPOSER_TIMEOUT}s" | tee -a "$LOG_FILE"
     else
-        echo "⚠ Composer self-update failed" | tee -a "$LOG_FILE"
+        echo "⚠ Composer self-update failed (exit code: $exit_code)" | tee -a "$LOG_FILE"
+    fi
+    
+    # Verify composer is still functional after failed update
+    if composer --version >/dev/null 2>&1; then
+        echo "✓ Composer is still functional at version: $(composer --version)" | tee -a "$LOG_FILE"
+    else
+        echo "⚠ Composer may be corrupted, attempting reinstall..." | tee -a "$LOG_FILE"
+        rm -f /usr/local/bin/composer /usr/bin/composer
+        install_composer_global || echo "⚠ Composer reinstall failed" | tee -a "$LOG_FILE"
     fi
 }
 
@@ -416,7 +474,7 @@ update_composer_major2
 
 # Final restart
 echo "Final Apache restart..."
-service apache2 restart
+restart_apache || true
 
 echo
 if [ -f /var/log/php-switch-error.log ]; then
