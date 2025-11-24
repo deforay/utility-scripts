@@ -398,12 +398,12 @@ COMPOSER_TIMEOUT=60
 install_composer_global() {
     echo "Installing Composer (verified)…"
     local installer sig actual
-    sig="$(curl -fsSL https://composer.github.io/installer.sig)" || {
+    sig="$(curl -fsSL --max-time 60 https://composer.github.io/installer.sig)" || {
         echo "Failed to fetch Composer installer signature."
         return 1
     }
     installer="$(mktemp)"
-    curl -fsSL https://getcomposer.org/installer -o "$installer" || {
+    curl -fsSL --max-time 60 https://getcomposer.org/installer -o "$installer" || {
         echo "Failed to download Composer installer."
         rm -f "$installer"
         return 1
@@ -414,8 +414,9 @@ install_composer_global() {
         rm -f "$installer"
         return 1
     fi
-    php "$installer" --no-ansi --quiet --install-dir=/usr/local/bin --filename=composer || {
-        echo "Composer installation failed."
+    # Use timeout to prevent hanging if the PHP script stalls
+    timeout "$COMPOSER_TIMEOUT" php "$installer" --no-ansi --install-dir=/usr/local/bin --filename=composer || {
+        echo "Composer installation failed or timed out."
         rm -f "$installer"
         return 1
     }
