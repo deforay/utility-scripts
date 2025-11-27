@@ -171,7 +171,8 @@ package_exists() { apt-cache show "$1" >/dev/null 2>&1; }
 
 install_with_fallback() {
   local pkg="$1" label="${2:-$1}" allow_missing="${3:-false}"
-  if apt-get install -y $APT_PPA_TARGET "$pkg"; then
+  # Use eval to properly handle APT_PPA_TARGET word splitting
+  if eval "apt-get install -y $APT_PPA_TARGET \"$pkg\""; then
     echo "✓ Installed ${label}"
     return 0
   fi
@@ -219,23 +220,25 @@ install_extension() {
 
   # Special-case redis - try versioned package first to avoid pulling in latest PHP version
   if [ "$ext_name" = "redis" ]; then
-    if ! php -m | grep -qi '^redis$' || [ "$FORCE_MODE" = true ]; then
-      echo "Installing php${PHP_VERSION}-redis..."
-      # Try versioned package first (php8.4-redis)
-      if package_exists "php${PHP_VERSION}-redis" && apt-get install -y $APT_PPA_TARGET "php${PHP_VERSION}-redis"; then
-        echo "✓ redis installed (versioned package)"
-        return 0
-      fi
-      # Fallback to unversioned if versioned doesn't exist (may pull latest PHP)
-      echo "⚠ Versioned redis not available, trying unversioned php-redis" | tee -a /var/log/php-switch-error.log
-      if apt-get install -y $APT_PPA_TARGET php-redis; then
-        echo "✓ redis installed (unversioned package - may have pulled newer PHP)" | tee -a /var/log/php-switch-error.log
-        return 0
-      fi
-      echo "⚠ Failed to install redis" >>/var/log/php-switch-error.log
+    # Only check if redis is loaded if php command exists
+    if command -v php >/dev/null 2>&1 && php -m 2>/dev/null | grep -qi '^redis$' && [ "$FORCE_MODE" = false ]; then
+      echo "✓ redis already loaded"
       return 0
     fi
-    echo "✓ redis already loaded"
+    
+    echo "Installing php${PHP_VERSION}-redis..."
+    # Try versioned package first (php8.4-redis)
+    if package_exists "php${PHP_VERSION}-redis" && eval "apt-get install -y $APT_PPA_TARGET \"php${PHP_VERSION}-redis\""; then
+      echo "✓ redis installed (versioned package)"
+      return 0
+    fi
+    # Fallback to unversioned if versioned doesn't exist (may pull latest PHP)
+    echo "⚠ Versioned redis not available, trying unversioned php-redis" | tee -a /var/log/php-switch-error.log
+    if eval "apt-get install -y $APT_PPA_TARGET php-redis"; then
+      echo "✓ redis installed (unversioned package - may have pulled newer PHP)" | tee -a /var/log/php-switch-error.log
+      return 0
+    fi
+    echo "⚠ Failed to install redis" >>/var/log/php-switch-error.log
     return 0
   fi
 
@@ -303,9 +306,9 @@ fi
 
 # Imagick - prefer versioned package to avoid pulling latest PHP version
 echo "Installing php${PHP_VERSION}-imagick..."
-if package_exists "php${PHP_VERSION}-imagick" && apt-get install -y $APT_PPA_TARGET "php${PHP_VERSION}-imagick"; then
+if package_exists "php${PHP_VERSION}-imagick" && eval "apt-get install -y $APT_PPA_TARGET \"php${PHP_VERSION}-imagick\""; then
   echo "✓ imagick installed (versioned)"
-elif apt-get install -y $APT_PPA_TARGET php-imagick; then
+elif eval "apt-get install -y $APT_PPA_TARGET php-imagick"; then
   echo "⚠ Installed unversioned php-imagick (may have pulled newer PHP)" | tee -a /var/log/php-switch-error.log
 else
   echo "⚠ php-imagick failed" >>/var/log/php-switch-error.log
@@ -316,9 +319,21 @@ echo "Configuring Apache for PHP ${PHP_VERSION}..."
 if [ ! -x /usr/sbin/a2enmod ] || [ ! -d /etc/apache2 ]; then
     echo "Apache2 not detected; installing apache2 for mod_php support..."
     ensure_package_installed apache2 "apache2 web server" || echo "⚠ apache2 install failed" | tee -a "$LOG_FILE"
+    # Check again after installation
+    if [ ! -x /usr/sbin/a2enmod ] || [ ! -d /etc/apache2 ]; then
+        echo "⚠ Apache2 still not detected after installation attempt" | tee -a "$LOG_FILE"
+    fi
 fi
 
 if [ -x /usr/sbin/a2enmod ] && [ -d /etc/apache2 ]; then
+    # Ensure mpm_prefork is enabled (required for mod_php)
+    if [ -f /etc/apache2/mods-available/mpm_prefork.load ]; then
+        # Disable conflicting MPM modules first
+        a2dismod mpm_event mpm_worker 2>/dev/null || true
+        # Enable mpm_prefork
+        a2enmod mpm_prefork 2>/dev/null || true
+    fi
+    
     enabled_php_versions=$(ls /etc/apache2/mods-enabled/ 2>/dev/null | grep -oP '^php\d\.\d' | sort -u || true)
     for ev in $enabled_php_versions; do
         if [ "$ev" != "php${PHP_VERSION}" ]; then
@@ -331,7 +346,7 @@ if [ -x /usr/sbin/a2enmod ] && [ -d /etc/apache2 ]; then
     apache_module_pkg="libapache2-mod-php${PHP_VERSION}"
     if ! dpkg -s "$apache_module_pkg" >/dev/null 2>&1; then
         echo "⚠ ${apache_module_pkg} not installed, installing now..." | tee -a "$LOG_FILE"
-        if ! apt-get install -y $APT_PPA_TARGET "$apache_module_pkg"; then
+        if ! eval "apt-get install -y $APT_PPA_TARGET \"$apache_module_pkg\""; then
             echo "⚠ Install via PPA pin failed, retrying without pin" | tee -a "$LOG_FILE"
             apt-get install -y "$apache_module_pkg" || echo "⚠ ${apache_module_pkg} install failed" | tee -a "$LOG_FILE"
         fi
@@ -341,7 +356,7 @@ if [ -x /usr/sbin/a2enmod ] && [ -d /etc/apache2 ]; then
     if [ ! -f "$mod_load_file" ]; then
         echo "⚠ Apache module php${PHP_VERSION} not found; reinstalling apache module package..."
         # Reinstall explicitly in case dpkg database thinks it's already present
-        if ! apt-get install -y --reinstall $APT_PPA_TARGET "libapache2-mod-php${PHP_VERSION}"; then
+        if ! eval "apt-get install -y --reinstall $APT_PPA_TARGET \"libapache2-mod-php${PHP_VERSION}\""; then
             echo "⚠ Reinstall via PPA pin failed, retrying without pin" | tee -a "$LOG_FILE"
             apt-get install -y --reinstall "libapache2-mod-php${PHP_VERSION}" || true
         fi
@@ -362,9 +377,15 @@ fi
 
 # CLI alternatives
 echo "Setting PHP ${PHP_VERSION} as default CLI..."
-update-alternatives --set php "/usr/bin/php${PHP_VERSION}" || true
-update-alternatives --set phar "/usr/bin/phar${PHP_VERSION}" 2>/dev/null || true
-update-alternatives --set phar.phar "/usr/bin/phar.phar${PHP_VERSION}" 2>/dev/null || true
+if [ -f "/usr/bin/php${PHP_VERSION}" ]; then
+    update-alternatives --set php "/usr/bin/php${PHP_VERSION}" || \
+        update-alternatives --install /usr/bin/php php "/usr/bin/php${PHP_VERSION}" 100
+    update-alternatives --set phar "/usr/bin/phar${PHP_VERSION}" 2>/dev/null || true
+    update-alternatives --set phar.phar "/usr/bin/phar.phar${PHP_VERSION}" 2>/dev/null || true
+else
+    echo "⚠ PHP ${PHP_VERSION} binary not found at /usr/bin/php${PHP_VERSION}" | tee -a "$LOG_FILE"
+    echo "⚠ PHP installation may have failed" | tee -a "$LOG_FILE"
+fi
 
 # php.ini tweaks
 CLI_PHP_INI="/etc/php/${PHP_VERSION}/cli/php.ini"
@@ -415,6 +436,13 @@ done
 COMPOSER_TIMEOUT=60
 
 install_composer_global() {
+    # Verify PHP is available before attempting Composer installation
+    if ! command -v php >/dev/null 2>&1; then
+        echo "⚠ PHP command not found, cannot install Composer" | tee -a "$LOG_FILE"
+        echo "⚠ PHP may not be properly installed or alternatives not set" | tee -a "$LOG_FILE"
+        return 1
+    fi
+    
     echo "Installing Composer (verified)…"
     local installer sig actual
     sig="$(curl -fsSL --max-time 60 https://composer.github.io/installer.sig)" || {
