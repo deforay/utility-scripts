@@ -505,7 +505,8 @@ if [ "$FORCE_MODE" = true ] || ! command -v composer >/dev/null 2>&1; then
 else
     echo "✓ Composer already installed (use --force to reinstall)"
 fi
-update_composer_major2
+
+composer self-update --2
 
 # Final restart
 echo "Final Apache restart..."
