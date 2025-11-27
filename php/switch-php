@@ -333,6 +333,16 @@ if [ -x /usr/sbin/a2enmod ] && [ -d /etc/apache2 ]; then
         fi
     done
 
+    # Verify libapache2-mod-php is installed before attempting to enable
+    apache_module_pkg="libapache2-mod-php${PHP_VERSION}"
+    if ! dpkg -s "$apache_module_pkg" >/dev/null 2>&1; then
+        echo "⚠ ${apache_module_pkg} not installed, installing now..." | tee -a "$LOG_FILE"
+        if ! apt-get install -y $APT_PPA_TARGET "$apache_module_pkg"; then
+            echo "⚠ Install via PPA pin failed, retrying without pin" | tee -a "$LOG_FILE"
+            apt-get install -y "$apache_module_pkg" || echo "⚠ ${apache_module_pkg} install failed" | tee -a "$LOG_FILE"
+        fi
+    fi
+
     mod_load_file="/etc/apache2/mods-available/php${PHP_VERSION}.load"
     if [ ! -f "$mod_load_file" ]; then
         echo "⚠ Apache module php${PHP_VERSION} not found; reinstalling apache module package..."
