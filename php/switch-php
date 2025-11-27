@@ -223,16 +223,25 @@ install_extension() {
   local ext_name="$1"
   local pkg="php${PHP_VERSION}-${ext_name}"
 
-  # Special-case redis (often unversioned as php-redis)
+  # Special-case redis - try versioned package first to avoid pulling in latest PHP version
   if [ "$ext_name" = "redis" ]; then
     if ! php -m | grep -qi '^redis$' || [ "$FORCE_MODE" = true ]; then
-      echo "Installing php-redis from PPA..."
-      if ! apt-get install -y $APT_PPA_TARGET php-redis; then
-        echo "⚠ Failed to install php-redis" >>/var/log/php-switch-error.log
+      echo "Installing php${PHP_VERSION}-redis..."
+      # Try versioned package first (php8.4-redis)
+      if package_exists "php${PHP_VERSION}-redis" && apt-get install -y $APT_PPA_TARGET "php${PHP_VERSION}-redis"; then
+        echo "✓ redis installed (versioned package)"
         return 0
       fi
+      # Fallback to unversioned if versioned doesn't exist (may pull latest PHP)
+      echo "⚠ Versioned redis not available, trying unversioned php-redis" | tee -a /var/log/php-switch-error.log
+      if apt-get install -y $APT_PPA_TARGET php-redis; then
+        echo "✓ redis installed (unversioned package - may have pulled newer PHP)" | tee -a /var/log/php-switch-error.log
+        return 0
+      fi
+      echo "⚠ Failed to install redis" >>/var/log/php-switch-error.log
+      return 0
     fi
-    echo "✓ redis loaded/installed"
+    echo "✓ redis already loaded"
     return 0
   fi
 
@@ -298,9 +307,15 @@ else
   echo "Skipping optional extensions (apcu, memcached, redis)"
 fi
 
-# Imagick (unversioned in PPA)
-echo "Installing php-imagick (PPA)…"
-apt-get install -y $APT_PPA_TARGET php-imagick || echo "⚠ php-imagick failed" >>/var/log/php-switch-error.log
+# Imagick - prefer versioned package to avoid pulling latest PHP version
+echo "Installing php${PHP_VERSION}-imagick..."
+if package_exists "php${PHP_VERSION}-imagick" && apt-get install -y $APT_PPA_TARGET "php${PHP_VERSION}-imagick"; then
+  echo "✓ imagick installed (versioned)"
+elif apt-get install -y $APT_PPA_TARGET php-imagick; then
+  echo "⚠ Installed unversioned php-imagick (may have pulled newer PHP)" | tee -a /var/log/php-switch-error.log
+else
+  echo "⚠ php-imagick failed" >>/var/log/php-switch-error.log
+fi
 
 # Apache module switch
 echo "Configuring Apache for PHP ${PHP_VERSION}..."
