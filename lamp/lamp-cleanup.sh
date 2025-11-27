@@ -42,6 +42,9 @@ rm -rf /root/.composer
 rm -rf /home/*/.composer
 rm -rf /home/*/.config/composer
 
+# Remove switch-php script
+rm -f /usr/local/bin/switch-php
+
 # Remove PHP alternatives
 update-alternatives --remove-all php 2>/dev/null || true
 update-alternatives --remove-all phar 2>/dev/null || true

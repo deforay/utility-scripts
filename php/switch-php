@@ -46,7 +46,6 @@ if [ $# -lt 1 ]; then
   echo "      --no-upgrade    Skip apt-get upgrade/autoremove step"
   echo "      --no-update     Skip apt-get update (useful on air-gapped/slow hosts)"
   echo "      --skip-base     Skip base dependency install"
-  echo "      --no-composer-update  Skip Composer self-update to the latest v2 release"
   exit 1
 fi
 
@@ -58,7 +57,6 @@ FAST_MODE=false
 SKIP_OPTIONAL_EXT=false
 SKIP_UPGRADE=false
 SKIP_BASE_PACKAGES=false
-UPDATE_COMPOSER=true
 RUN_APT_UPDATE=true
 APT_UPDATED=false
 
@@ -88,8 +86,6 @@ while [ $# -gt 0 ]; do
     --no-update)
       RUN_APT_UPDATE=false
       ;;
-    --no-composer-update)
-      UPDATE_COMPOSER=false
       ;;
     *)
       echo "Unknown option: $1"
@@ -454,46 +450,6 @@ install_composer_global() {
     echo "✓ Composer installed at $(/usr/local/bin/composer -V 2>/dev/null || echo /usr/local/bin/composer)"
 }
 
-update_composer_major2() {
-    [ "$UPDATE_COMPOSER" = true ] || return 0
-    command -v composer >/dev/null 2>&1 || return 0
-    
-    # Skip update if composer was just installed (version 2.9+ is current)
-    local current_version
-    current_version=$(composer --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
-    if [[ "$current_version" =~ ^2\.[89]\. ]]; then
-        echo "✓ Composer ${current_version} is recent, skipping self-update"
-        return 0
-    fi
-    
-    echo "Updating Composer to latest v2…"
-    
-    # Set environment variables to suppress interactive warnings
-    export COMPOSER_ALLOW_SUPERUSER=1
-    export COMPOSER_NO_INTERACTION=1
-    
-    # Show output to prevent appearance of hanging
-    if timeout "$COMPOSER_TIMEOUT" composer self-update --2 --no-interaction 2>&1; then
-        echo "✓ Composer now $(composer --version 2>/dev/null || echo 'updated')"
-        return 0
-    fi
-    
-    local exit_code=$?
-    if [ $exit_code -eq 124 ]; then
-        echo "⚠ Composer self-update timed out after ${COMPOSER_TIMEOUT}s" | tee -a "$LOG_FILE"
-    else
-        echo "⚠ Composer self-update failed (exit code: $exit_code)" | tee -a "$LOG_FILE"
-    fi
-    
-    # Verify composer is still functional after failed update
-    if composer --version >/dev/null 2>&1; then
-        echo "✓ Composer is still functional at version: $(composer --version)" | tee -a "$LOG_FILE"
-    else
-        echo "⚠ Composer may be corrupted, attempting reinstall..." | tee -a "$LOG_FILE"
-        rm -f /usr/local/bin/composer /usr/bin/composer
-        install_composer_global || echo "⚠ Composer reinstall failed" | tee -a "$LOG_FILE"
-    fi
-}
 
 # Composer
 if [ "$FORCE_MODE" = true ] || ! command -v composer >/dev/null 2>&1; then
@@ -506,7 +462,6 @@ else
     echo "✓ Composer already installed (use --force to reinstall)"
 fi
 
-composer self-update --2
 
 # Final restart
 echo "Final Apache restart..."
