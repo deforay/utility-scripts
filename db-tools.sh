@@ -2725,9 +2725,23 @@ tune() {
     log INFO "=== Database Tuning Advisor ==="
     
     # 1. MySQLTuner
+    # Calculate total memory for --forcemem if needed, or omit it.
+    # mysqltuner requires a value for --forcemem (MB).
+    local total_mem_mb
+    total_mem_mb=$(free -m 2>/dev/null | awk '/Mem:/ {print $2}' || echo "")
+    
+    local tuner_args=(--nocolor)
+    # Only add forcemem if we successfully got memory size
+    if [[ -n "$total_mem_mb" && "$total_mem_mb" -gt 0 ]]; then
+        tuner_args+=(--forcemem "$total_mem_mb")
+    fi
+
     if have mysqltuner; then
         log INFO "Running MySQLTuner..."
-        mysqltuner --silent --forcemem --nocolor 2>/dev/null || true
+        # Remove --silent to see output, or keep it if user wants less noise. 
+        # But usually tuning output is the point. 
+        # The user's log showed help text because of invalid args.
+        mysqltuner "${tuner_args[@]}" 2>/dev/null || true
     else
         warn "mysqltuner not found. Attempting to download..."
         
@@ -2744,10 +2758,10 @@ tune() {
             if (( install_mode )); then
                 chmod +x "$tuner_path"
                 log INFO "✅ Installed mysqltuner to $tuner_path"
-                "$tuner_path" --silent --forcemem --nocolor 2>/dev/null || true
+                "$tuner_path" "${tuner_args[@]}" 2>/dev/null || true
             else
                 log INFO "Running temporary mysqltuner.pl..."
-                perl "$tuner_path" --silent --forcemem --nocolor 2>/dev/null || true
+                perl "$tuner_path" "${tuner_args[@]}" 2>/dev/null || true
                 rm "$tuner_path"
             fi
         else
@@ -2760,7 +2774,8 @@ tune() {
     # 2. Percona Toolkit (pt-variable-advisor)
     if have pt-variable-advisor; then
         log INFO "Running Percona pt-variable-advisor..."
-        "$MYSQL" --login-path="$LOGIN_PATH" -e "SHOW VARIABLES" | pt-variable-advisor --quiet - || true
+        # --quiet is not a valid option for pt-variable-advisor
+        "$MYSQL" --login-path="$LOGIN_PATH" -e "SHOW VARIABLES" | pt-variable-advisor - || true
     else
         warn "pt-variable-advisor not found (install percona-toolkit)"
     fi
