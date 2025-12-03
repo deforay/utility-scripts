@@ -2,9 +2,8 @@
 # db-tools.sh — MySQL/MariaDB admin toolkit
 # Features: backups, PITR, encryption, notifications, health checks, GFS rotation
 #
-# Install:
-#   sudo wget -O /usr/local/bin/db-tools https://raw.githubusercontent.com/deforay/utility-scripts/master/db-tools.sh
-#   sudo chmod +x /usr/local/bin/db-tools
+# Installation:
+#   sudo curl -fsSL https://raw.githubusercontent.com/deforay/utility-scripts/master/db-tools.sh -o /usr/local/bin/db-tools && sudo chmod +x /usr/local/bin/db-tools
 #
 # Usage:
 #   db-tools init
@@ -21,6 +20,7 @@ set -euo pipefail
 
 # ========================== Configuration ==========================
 CONFIG_FILE="${CONFIG_FILE:-/etc/db-tools.conf}"
+ENV_FILE="${ENV_FILE:-.env}"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/mysql}"
 LOG_DIR="${LOG_DIR:-/var/log/db-tools}"
 RETENTION_DAYS="${RETENTION_DAYS:-7}"
@@ -666,6 +666,16 @@ is_locked() {
 # ========================== Configuration Loading ==========================
 
 load_config() {
+    # Load from .env if present (local override)
+    if [[ -f "$ENV_FILE" ]]; then
+        # shellcheck disable=SC1090
+        set -a
+        source "$ENV_FILE"
+        set +a
+        debug "Configuration loaded from $ENV_FILE"
+    fi
+
+    # Load from system config
     if [[ -f "$CONFIG_FILE" ]]; then
         # shellcheck disable=SC1090
         source "$CONFIG_FILE"
@@ -674,6 +684,19 @@ load_config() {
 }
 
 # ========================== Tool Checking ==========================
+
+check_core_dependencies() {
+    local missing=()
+    for tool in curl awk sed grep cut date tr head tail sort uniq; do
+        if ! have "$tool"; then
+            missing+=("$tool")
+        fi
+    done
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        err "Missing core dependencies: ${missing[*]}. Please install them."
+    fi
+}
 
 need_tooling() {
     [[ -n "$MYSQL" ]]     || err "mysql client not found"
@@ -2205,12 +2228,23 @@ restore() {
     need_tooling
     require_login
 
-    acquire_lock 300 "restore"
-    
     local arg1="${1:-}"
     local target_db_opt="${2:-}"
     local until_time="${UNTIL_TIME:-}"
     local end_pos="${END_POS:-}"
+    
+    # Safety check: Confirmation
+    if [[ "${FORCE_RESTORE:-0}" != "1" ]]; then
+        warn "WARNING: Restore operation may overwrite existing data!"
+        if [[ -t 0 ]]; then
+            read -r -p "Are you sure you want to continue? [y/N] " confirm
+            [[ "$confirm" =~ ^[Yy]$ ]] || { log INFO "Restore cancelled."; return 0; }
+        else
+            err "Non-interactive restore requires FORCE_RESTORE=1 environment variable."
+        fi
+    fi
+
+    acquire_lock 300 "restore"
     
     # Validate datetime format if provided
     if [[ -n "$until_time" ]]; then
@@ -2688,21 +2722,54 @@ health() {
 tune() {
     require_login
     
+    log INFO "=== Database Tuning Advisor ==="
+    
+    # 1. MySQLTuner
     if have mysqltuner; then
         log INFO "Running MySQLTuner..."
         mysqltuner --silent --forcemem --nocolor 2>/dev/null || true
     else
-        warn "mysqltuner not found (install: apt-get install mysqltuner)"
+        warn "mysqltuner not found. Attempting to download..."
+        
+        # Determine install location
+        local tuner_path="mysqltuner.pl"
+        local install_mode=0
+        
+        if [[ "$EUID" -eq 0 ]]; then
+            tuner_path="/usr/local/bin/mysqltuner"
+            install_mode=1
+        fi
+
+        if curl -fsSL http://mysqltuner.pl/ -o "$tuner_path"; then
+            if (( install_mode )); then
+                chmod +x "$tuner_path"
+                log INFO "✅ Installed mysqltuner to $tuner_path"
+                "$tuner_path" --silent --forcemem --nocolor 2>/dev/null || true
+            else
+                log INFO "Running temporary mysqltuner.pl..."
+                perl "$tuner_path" --silent --forcemem --nocolor 2>/dev/null || true
+                rm "$tuner_path"
+            fi
+        else
+            warn "Failed to download mysqltuner. Install manually: apt-get install mysqltuner"
+        fi
     fi
     
     echo
     
+    # 2. Percona Toolkit (pt-variable-advisor)
     if have pt-variable-advisor; then
         log INFO "Running Percona pt-variable-advisor..."
         "$MYSQL" --login-path="$LOGIN_PATH" -e "SHOW VARIABLES" | pt-variable-advisor --quiet - || true
     else
         warn "pt-variable-advisor not found (install percona-toolkit)"
     fi
+
+    echo
+    
+    # 3. Percona Configuration Wizard (Online)
+    log INFO "For advanced configuration generation, visit Percona Configuration Wizard:"
+    log INFO "https://tools.percona.com/wizard"
 }
 
 # ========================== Maintenance ==========================
@@ -3006,6 +3073,7 @@ Commands:
   health                        Run system health check
   sizes                         Show database and table sizes
   tune                          Run tuning advisors (mysqltuner, pt-variable-advisor)
+  tune-parallel                 Show auto-tuned parallel jobs count
   maintain [quick|full]         Run ANALYZE (quick) or OPTIMIZE (full)
   cleanup [days]                Remove old backups (default: RETENTION_DAYS)
   
@@ -3110,6 +3178,9 @@ status() {
 # Load configuration
 load_config
 
+# Check core dependencies early
+check_core_dependencies
+
 # Auto-tune PARALLEL_JOBS if not set or invalid
 if ! [[ "${PARALLEL_JOBS:-}" =~ ^[1-9][0-9]*$ ]]; then
   PARALLEL_JOBS="$(auto_parallel_jobs)"
@@ -3154,6 +3225,9 @@ case "$cmd" in
         ;;
     tune)
         tune "$@"
+        ;;
+    tune-parallel)
+        echo "Auto-tuned PARALLEL_JOBS: $(auto_parallel_jobs)"
         ;;
     maintain)
         maintain "${1:-quick}"
