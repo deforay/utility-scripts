@@ -1,510 +1,374 @@
 #!/bin/bash
-set -euo pipefail
-
-# To use this script:
-# sudo wget https://raw.githubusercontent.com/deforay/utility-scripts/master/php/switch-php -O /usr/local/bin/switch-php && sudo chmod +x /usr/local/bin/switch-php
-# sudo switch-php 7.4
+#
+# Installation:
+# sudo curl -fsSL https://raw.githubusercontent.com/deforay/utility-scripts/master/php/switch-php -o /usr/local/bin/switch-php && sudo chmod +x /usr/local/bin/switch-php
+#
+# Usage:
 # sudo switch-php 8.2
-# sudo switch-php 8.3
-# sudo switch-php 8.2 -f
-# sudo switch-php 8.2 --force
+# sudo switch-php 8.3 --force
+#
+# Robust PHP Switcher for Ubuntu
+# Idempotent, Resilient, and Safe
+#
+set -euo pipefail
+IFS=$'\n\t'
 
-# Root check
-if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-  echo "Please run as root."
-  exit 1
+# --- Configuration ---
+LOG_FILE="/var/log/php-switch.log"
+LOCK_FILE="/var/lock/php-switch.lock"
+DEBIAN_FRONTEND=noninteractive
+RETRIES=3
+DELAY=5
+
+# --- Colors ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# --- Helper Functions ---
+
+log() {
+    local level="$1"
+    local msg="$2"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "${timestamp} [${level}] ${msg}" | tee -a "$LOG_FILE"
+}
+
+info() { log "INFO" "${GREEN}${1}${NC}"; }
+warn() { log "WARN" "${YELLOW}${1}${NC}"; }
+error() { log "ERROR" "${RED}${1}${NC}"; }
+fatal() { log "FATAL" "${RED}${1}${NC}"; exit 1; }
+
+# Retry wrapper for network/lock sensitive commands
+run_with_retry() {
+    local n=1
+    local max=$RETRIES
+    local delay=$DELAY
+    while true; do
+        if "$@"; then
+            return 0
+        else
+            if [[ $n -lt $max ]]; then
+                ((n++))
+                warn "Command failed. Retrying $n/$max in ${delay}s..."
+                sleep $delay
+            else
+                error "The command has failed after $n attempts."
+                return 1
+            fi
+        fi
+    done
+}
+
+# --- Pre-flight Checks ---
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    fatal "Please run as root."
 fi
 
-# Ubuntu 20.04+
-check_ubuntu_version() {
-  . /etc/os-release
-  if [ "${ID:-}" != "ubuntu" ]; then
-    echo "This script is intended for Ubuntu."
-    exit 1
-  fi
-  VERSION_MAJOR="${VERSION_ID%.*}"
-  if [ "${VERSION_MAJOR:-0}" -lt 20 ]; then
-    echo "This script requires Ubuntu 20.04 or higher."
-    exit 1
-  fi
-}
-check_ubuntu_version
+# Acquire lock to prevent concurrent runs
+exec 200>"$LOCK_FILE"
+flock -n 200 || fatal "Another instance is already running."
 
-# Fresh log for this run
-LOG_FILE="/var/log/php-switch-error.log"
-# echo "PHP switch run $(date -Is)" > "$LOG_FILE"
-chmod 0644 "$LOG_FILE" || true
+# --- Argument Parsing ---
 
-# Parse arguments
-if [ $# -lt 1 ]; then
-  echo "Provide PHP version (e.g., 7.4, 8.0, 8.1, 8.2, 8.3)"
-  echo "Options:"
-  echo "  -f, --force         Force reinstall PHP, extensions, and Composer"
-  echo "      --fast          Skip apt upgrade/base package install/optional extensions"
-  echo "      --no-optional   Skip optional extensions (apcu, memcached, redis)"
-  echo "      --no-upgrade    Skip apt-get upgrade/autoremove step"
-  echo "      --no-update     Skip apt-get update (useful on air-gapped/slow hosts)"
-  echo "      --skip-base     Skip base dependency install"
-  exit 1
+if [[ $# -lt 1 ]]; then
+    echo "Usage: $0 <php-version> [options]"
+    echo "Example: $0 8.2 --force"
+    exit 1
 fi
 
 PHP_VERSION="$1"
 shift
 
 FORCE_MODE=false
+SKIP_UPDATE=false
 FAST_MODE=false
-SKIP_OPTIONAL_EXT=false
-SKIP_UPGRADE=false
-SKIP_BASE_PACKAGES=false
-RUN_APT_UPDATE=true
-APT_UPDATED=false
 
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -f|--force)
-      FORCE_MODE=true
-      echo "Force mode enabled: will reinstall PHP, extensions, and Composer"
-      ;;
-    --fast)
-      FAST_MODE=true
-      SKIP_OPTIONAL_EXT=true
-      SKIP_UPGRADE=true
-      SKIP_BASE_PACKAGES=true
-      RUN_APT_UPDATE=false
-      echo "Fast mode enabled: skipping apt-get update/upgrade, base packages, and optional extensions"
-      ;;
-    --no-optional)
-      SKIP_OPTIONAL_EXT=true
-      ;;
-    --no-upgrade)
-      SKIP_UPGRADE=true
-      ;;
-    --skip-base)
-      SKIP_BASE_PACKAGES=true
-      ;;
-    --no-update)
-      RUN_APT_UPDATE=false
-      ;;
-    *)
-      echo "Unknown option: $1"
-      exit 1
-      ;;
-  esac
-  shift
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -f|--force) FORCE_MODE=true ;;
+        --no-update) SKIP_UPDATE=true ;;
+        --fast) 
+            FAST_MODE=true
+            SKIP_UPDATE=true
+            ;;
+        *) warn "Unknown option: $1" ;;
+    esac
+    shift
 done
 
-apt_update() {
-  local force="${1:-false}"
-  if [ "$RUN_APT_UPDATE" = false ]; then
-    echo "Skipping apt-get update (--fast/--no-update)"
-    return 0
-  fi
-  if [ "$force" != "true" ] && [ "$APT_UPDATED" = "true" ]; then
-    return 0
-  fi
-  apt-get update
-  APT_UPDATED=true
-}
-
-restart_apache() {
-  echo "Restarting Apache..."
-  if timeout 20 service apache2 restart; then
-    return 0
-  fi
-  echo "⚠ Apache restart timed out or failed; attempting systemctl restart" | tee -a "$LOG_FILE"
-  timeout 20 systemctl restart apache2 || echo "⚠ systemctl restart apache2 also failed" | tee -a "$LOG_FILE"
-}
-
-# Refresh base packages
-apt_update
-if [ "$SKIP_UPGRADE" = false ]; then
-  apt-get -y upgrade
-  apt-get -y autoremove
-fi
-dpkg --configure -a
-
-if [ "$SKIP_BASE_PACKAGES" = false ]; then
-  apt-get install -y --no-install-recommends \
-    build-essential software-properties-common gnupg apt-transport-https \
-    ca-certificates lsb-release wget vim zip unzip curl acl snapd rsync git \
-    gdebi net-tools sed mawk magic-wormhole openssh-server libsodium-dev \
-    mosh aria2 imagemagick
+if [[ "$FAST_MODE" == "true" ]]; then
+    info "Fast mode enabled: skipping apt update and optional extensions."
 fi
 
-ensure_ppa() {
-  local ppa="$1" pattern="$2"
-  if ls /etc/apt/sources.list.d/${pattern} >/dev/null 2>&1; then
-    echo "✓ ${ppa} already present"
-    return 0
-  fi
-  echo "Adding ${ppa}..."
-  LC_ALL=C.UTF-8 add-apt-repository -y "${ppa}" || true
+info "Starting PHP Switch to version: $PHP_VERSION"
+
+# --- System Prep ---
+
+# Ensure basic tools are present (idempotent)
+ensure_base_tools() {
+    info "Ensuring base tools..."
+    # Check if we need to install anything to avoid apt overhead
+    if ! dpkg -s software-properties-common curl unzip >/dev/null 2>&1; then
+        run_with_retry apt-get update
+        run_with_retry apt-get install -y software-properties-common curl unzip acl
+    fi
 }
 
-# Add Ondřej's PPAs (idempotent) and update
-ensure_ppa "ppa:ondrej/php" "ondrej-ubuntu-php*"
-ensure_ppa "ppa:ondrej/apache2" "ondrej-ubuntu-apache2*"
-apt_update true
+# Add PPA safely
+setup_ppa() {
+    local ppa_name="ondrej/php"
+    local ppa_file="/etc/apt/sources.list.d/ondrej-ubuntu-php-$(lsb_release -cs).list"
+    
+    if [[ ! -f "$ppa_file" ]]; then
+        info "Adding PPA: $ppa_name"
+        run_with_retry add-apt-repository -y ppa:$ppa_name
+        SKIP_UPDATE=false # Force update if we just added PPA
+    else
+        info "PPA $ppa_name already present."
+    fi
+}
 
-# Verify PPA presence
-if ! ls /etc/apt/sources.list.d/ondrej-ubuntu-php* >/dev/null 2>&1; then
-  echo "⚠ Ondřej PHP PPA list file not found"
+ensure_base_tools
+setup_ppa
+
+if [[ "$SKIP_UPDATE" == "false" ]]; then
+    info "Updating package lists..."
+    run_with_retry apt-get update
 fi
 
-# Prefer PPA packages
-cat >/etc/apt/preferences.d/ondrej-php.pref <<'EOF'
-Package: php*
-Pin: release o=LP-PPA-ondrej-php
-Pin-Priority: 700
+# --- PHP Installation ---
 
-Package: apache2*
-Pin: release o=LP-PPA-ondrej-apache2
-Pin-Priority: 700
+install_php_packages() {
+    local version="$1"
+    
+    # Critical packages - must succeed
+    local critical_packages=(
+        "php${version}"
+        "php${version}-cli"
+        "php${version}-common"
+        "libapache2-mod-php${version}"
+    )
+
+    # Standard Extensions - usually required
+    local standard_extensions=(
+        "php${version}-curl"
+        "php${version}-gd"
+        "php${version}-mbstring"
+        "php${version}-xml"
+        "php${version}-zip"
+        "php${version}-mysql"
+        "php${version}-bcmath"
+        "php${version}-intl"
+        "php${version}-gmp"
+        "php${version}-opcache"
+        "php${version}-sqlite3"
+        "php${version}-imagick"
+    )
+
+    # Optional Extensions - skipped in fast mode
+    local optional_extensions=(
+        "php${version}-redis"
+        "php${version}-apcu"
+        "php${version}-memcached"
+    )
+
+    info "Installing PHP $version critical packages..."
+    if ! run_with_retry apt-get install -y "${critical_packages[@]}"; then
+        fatal "Failed to install critical PHP packages. Aborting."
+    fi
+
+    local extensions_to_install=("${standard_extensions[@]}")
+    if [[ "$FAST_MODE" == "false" ]]; then
+        extensions_to_install+=("${optional_extensions[@]}")
+    else
+        info "Skipping optional extensions (redis, apcu, memcached)..."
+    fi
+
+    info "Installing PHP extensions..."
+    # Try batch install first for speed
+    if ! apt-get install -y "${extensions_to_install[@]}"; then
+        warn "Batch extension install failed. Attempting individual installation..."
+        for pkg in "${extensions_to_install[@]}"; do
+            # Check if package exists first to avoid apt error noise
+            if apt-cache show "$pkg" >/dev/null 2>&1; then
+                if ! run_with_retry apt-get install -y "$pkg"; then
+                    error "Failed to install $pkg"
+                else
+                    info "Installed $pkg"
+                fi
+            else
+                warn "Package $pkg not found, skipping."
+            fi
+        done
+    else
+        info "All extensions installed successfully."
+    fi
+}
+
+install_php_packages "$PHP_VERSION"
+
+# --- Configuration (The Idempotent Way) ---
+
+configure_php_tuning() {
+    local version="$1"
+    local conf_dir="/etc/php/${version}/mods-available"
+    local conf_file="${conf_dir}/99-custom-tuning.ini"
+
+    info "Applying PHP configuration tuning..."
+
+    # Create the directory if it doesn't exist (rare)
+    mkdir -p "$conf_dir"
+
+    # Write configuration to a separate file.
+    # This is idempotent: it overwrites the file with the desired state.
+    cat > "$conf_file" <<EOF
+; Custom PHP Tuning generated by switch-php
+; Do not edit manually, changes will be overwritten.
+[PHP]
+memory_limit = 512M
+upload_max_filesize = 100M
+post_max_size = 100M
+max_execution_time = 300
+date.timezone = UTC
+expose_php = Off
+error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT
+display_errors = Off
+log_errors = On
+
+[opcache]
+opcache.enable=1
+opcache.memory_consumption=128
+opcache.interned_strings_buffer=8
+opcache.max_accelerated_files=4000
+opcache.revalidate_freq=60
 EOF
-apt_update true
 
-# Force apt to pick from the PPA when available
-APT_PPA_TARGET="-t o=LP-PPA-ondrej-php"
-
-# Helpers
-package_exists() { apt-cache show "$1" >/dev/null 2>&1; }
-
-install_with_fallback() {
-  local pkg="$1" label="${2:-$1}" allow_missing="${3:-false}"
-  # Use eval to properly handle APT_PPA_TARGET word splitting
-  if eval "apt-get install -y $APT_PPA_TARGET \"$pkg\""; then
-    echo "✓ Installed ${label}"
-    return 0
-  fi
-
-  echo "⚠ ${label} install via PPA target failed, retrying without pin" | tee -a /var/log/php-switch-error.log
-  if apt-get install -y "$pkg"; then
-    echo "✓ Installed ${label}"
-    return 0
-  fi
-
-  if [ "$allow_missing" = true ]; then
-    echo "⚠ ${label} not available; continuing" | tee -a /var/log/php-switch-error.log
-    return 0
-  fi
-
-  echo "✗ Failed to install ${label}" | tee -a /var/log/php-switch-error.log
-  return 1
+    # Enable the module for all SAPIs (cli, apache2, fpm)
+    # phpenmod is idempotent
+    phpenmod -v "$version" 99-custom-tuning
 }
 
-ensure_package_installed() {
-  local pkg="$1" label="${2:-$1}"
-  if [ "$FORCE_MODE" = false ] && dpkg -s "$pkg" >/dev/null 2>&1; then
-    echo "✓ ${label} already installed"
-    return 0
-  fi
+configure_php_tuning "$PHP_VERSION"
 
-  echo "Installing ${label}..."
-  install_with_fallback "$pkg" "$label"
-}
+# --- Apache Switching ---
 
-# Ensure base PHP + Apache module
-ensure_package_installed "php${PHP_VERSION}" "PHP ${PHP_VERSION}"
-apache_module_pkg="libapache2-mod-php${PHP_VERSION}"
-if ! ensure_package_installed "$apache_module_pkg" "$apache_module_pkg"; then
-  echo "⚠ ${apache_module_pkg} install failed; checking availability..." | tee -a /var/log/php-switch-error.log
-  if ! package_exists "$apache_module_pkg"; then
-    echo "⚠ ${apache_module_pkg} not found in apt cache (PPA may not have this version yet)" | tee -a /var/log/php-switch-error.log
-  fi
-  apt-cache policy "$apache_module_pkg" >>/var/log/php-switch-error.log 2>&1 || true
-fi
-
-install_extension() {
-  local ext_name="$1"
-  local pkg="php${PHP_VERSION}-${ext_name}"
-
-  # Special-case redis - try versioned package first to avoid pulling in latest PHP version
-  if [ "$ext_name" = "redis" ]; then
-    # Only check if redis is loaded if php command exists
-    if command -v php >/dev/null 2>&1 && php -m 2>/dev/null | grep -qi '^redis$' && [ "$FORCE_MODE" = false ]; then
-      echo "✓ redis already loaded"
-      return 0
-    fi
+switch_apache_module() {
+    local version="$1"
     
-    echo "Installing php${PHP_VERSION}-redis..."
-    # Try versioned package first (php8.4-redis)
-    if package_exists "php${PHP_VERSION}-redis" && eval "apt-get install -y $APT_PPA_TARGET \"php${PHP_VERSION}-redis\""; then
-      echo "✓ redis installed (versioned package)"
-      return 0
+    if [[ ! -d /etc/apache2 ]]; then
+        warn "Apache2 not found, skipping module switch."
+        return
     fi
-    # Fallback to unversioned if versioned doesn't exist (may pull latest PHP)
-    echo "⚠ Versioned redis not available, trying unversioned php-redis" | tee -a /var/log/php-switch-error.log
-    if eval "apt-get install -y $APT_PPA_TARGET php-redis"; then
-      echo "✓ redis installed (unversioned package - may have pulled newer PHP)" | tee -a /var/log/php-switch-error.log
-      return 0
-    fi
-    echo "⚠ Failed to install redis" >>/var/log/php-switch-error.log
-    return 0
-  fi
 
-  # Normal versioned package path
-  if [ "$FORCE_MODE" = false ] && dpkg -l | grep -q "^ii\s\+${pkg}\s"; then
-    echo "✓ ${pkg} already installed"
-    return 0
-  fi
+    info "Switching Apache to PHP $version..."
 
-  echo "Installing ${pkg}..."
-  if package_exists "${pkg}"; then
-    if install_with_fallback "${pkg}" "${pkg}"; then
-      return 0
-    fi
-  fi
+    # Disable all other PHP modules
+    # We find them dynamically to be robust against any installed version
+    local current_modules
+    current_modules=$(a2query -m | grep -o 'php[0-9]\.[0-9]' || true)
 
-  # sqlite3 may be missing for some PHP/Ubuntu combos on focal
-  if [ "$ext_name" = "sqlite3" ]; then
-    echo "⚠ ${pkg} not available from PPA on this release" | tee -a /var/log/php-switch-error.log
-    echo "  → Consider PHP 8.3 on focal (php8.3-sqlite3) or upgrade to Ubuntu 22.04/24.04." | tee -a /var/log/php-switch-error.log
-    echo "  → Continuing installation without sqlite3..." | tee -a /var/log/php-switch-error.log
-    return 0
-  fi
-
-  echo "⚠ Could not install ${pkg}" | tee -a /var/log/php-switch-error.log
-  return 0
-}
-
-# Core extensions (keep names that actually exist)
-extensions=(
-  common
-  cli
-  mysql      # provides pdo_mysql + mysqli
-  zip
-  gd
-  mbstring
-  curl
-  xml
-  bcmath
-  gmp
-  intl
-  opcache
-  sqlite3    # may be absent for PHP 8.2 on focal; handled in install_extension()
-)
-
-optional_extensions=(
-  apcu
-  memcached
-  redis
-)
-
-echo "Installing core PHP extensions..."
-for ext in "${extensions[@]}"; do
-  install_extension "$ext" || true
-done
-
-echo "Installing optional PHP extensions..."
-if [ "$SKIP_OPTIONAL_EXT" = false ]; then
-  for ext in "${optional_extensions[@]}"; do
-    install_extension "$ext" || true
-  done
-else
-  echo "Skipping optional extensions (apcu, memcached, redis)"
-fi
-
-# Imagick - prefer versioned package to avoid pulling latest PHP version
-echo "Installing php${PHP_VERSION}-imagick..."
-if package_exists "php${PHP_VERSION}-imagick" && eval "apt-get install -y $APT_PPA_TARGET \"php${PHP_VERSION}-imagick\""; then
-  echo "✓ imagick installed (versioned)"
-elif eval "apt-get install -y $APT_PPA_TARGET php-imagick"; then
-  echo "⚠ Installed unversioned php-imagick (may have pulled newer PHP)" | tee -a /var/log/php-switch-error.log
-else
-  echo "⚠ php-imagick failed" >>/var/log/php-switch-error.log
-fi
-
-# Apache module switch
-echo "Configuring Apache for PHP ${PHP_VERSION}..."
-if [ ! -x /usr/sbin/a2enmod ] || [ ! -d /etc/apache2 ]; then
-    echo "Apache2 not detected; installing apache2 for mod_php support..."
-    ensure_package_installed apache2 "apache2 web server" || echo "⚠ apache2 install failed" | tee -a "$LOG_FILE"
-    # Check again after installation
-    if [ ! -x /usr/sbin/a2enmod ] || [ ! -d /etc/apache2 ]; then
-        echo "⚠ Apache2 still not detected after installation attempt" | tee -a "$LOG_FILE"
-    fi
-fi
-
-if [ -x /usr/sbin/a2enmod ] && [ -d /etc/apache2 ]; then
-    # Ensure mpm_prefork is enabled (required for mod_php)
-    if [ -f /etc/apache2/mods-available/mpm_prefork.load ]; then
-        # Disable conflicting MPM modules first
-        a2dismod mpm_event mpm_worker 2>/dev/null || true
-        # Enable mpm_prefork
-        a2enmod mpm_prefork 2>/dev/null || true
-    fi
-    
-    enabled_php_versions=$(ls /etc/apache2/mods-enabled/ 2>/dev/null | grep -oP '^php\d\.\d' | sort -u || true)
-    for ev in $enabled_php_versions; do
-        if [ "$ev" != "php${PHP_VERSION}" ]; then
-            echo "Disabling $ev"
-            a2dismod "$ev" || true
+    for mod in $current_modules; do
+        if [[ "$mod" != "php${version}" ]]; then
+            info "Disabling Apache module: $mod"
+            a2dismod -f "$mod" || true
         fi
     done
 
-    # Verify libapache2-mod-php is installed before attempting to enable
-    apache_module_pkg="libapache2-mod-php${PHP_VERSION}"
-    if ! dpkg -s "$apache_module_pkg" >/dev/null 2>&1; then
-        echo "⚠ ${apache_module_pkg} not installed, installing now..." | tee -a "$LOG_FILE"
-        if ! eval "apt-get install -y $APT_PPA_TARGET \"$apache_module_pkg\""; then
-            echo "⚠ Install via PPA pin failed, retrying without pin" | tee -a "$LOG_FILE"
-            apt-get install -y "$apache_module_pkg" || echo "⚠ ${apache_module_pkg} install failed" | tee -a "$LOG_FILE"
-        fi
+    # Enable mpm_prefork if not active (required for mod_php)
+    if ! a2query -m mpm_prefork >/dev/null 2>&1; then
+        info "Enabling mpm_prefork..."
+        a2dismod -f mpm_event mpm_worker || true
+        a2enmod mpm_prefork || true
     fi
 
-    mod_load_file="/etc/apache2/mods-available/php${PHP_VERSION}.load"
-    if [ ! -f "$mod_load_file" ]; then
-        echo "⚠ Apache module php${PHP_VERSION} not found; reinstalling apache module package..."
-        # Reinstall explicitly in case dpkg database thinks it's already present
-        if ! eval "apt-get install -y --reinstall $APT_PPA_TARGET \"libapache2-mod-php${PHP_VERSION}\""; then
-            echo "⚠ Reinstall via PPA pin failed, retrying without pin" | tee -a "$LOG_FILE"
-            apt-get install -y --reinstall "libapache2-mod-php${PHP_VERSION}" || true
-        fi
-        apt-cache policy "libapache2-mod-php${PHP_VERSION}" >>"$LOG_FILE" 2>&1 || true
-    fi
+    # Enable the target version
+    info "Enabling Apache module: php${version}"
+    a2enmod "php${version}"
+}
 
-    if [ -f "$mod_load_file" ]; then
-        echo "Enabling php${PHP_VERSION} module"
-        if ! a2enmod "php${PHP_VERSION}"; then
-            echo "⚠ Failed to enable php${PHP_VERSION} module" | tee -a "$LOG_FILE"
-        fi
+switch_apache_module "$PHP_VERSION"
+
+# --- CLI Alternatives ---
+
+update_alternatives() {
+    local version="$1"
+    info "Updating CLI alternatives..."
+    
+    if [[ -f "/usr/bin/php${version}" ]]; then
+        update-alternatives --set php "/usr/bin/php${version}"
+        update-alternatives --set phar "/usr/bin/phar${version}" 2>/dev/null || true
+        update-alternatives --set phar.phar "/usr/bin/phar.phar${version}" 2>/dev/null || true
     else
-        echo "⚠ Apache module php${PHP_VERSION} still missing after reinstall" | tee -a "$LOG_FILE"
+        error "Binary /usr/bin/php${version} not found!"
     fi
-else
-    echo "⚠ Apache2 not detected; skipping Apache module configuration" | tee -a "$LOG_FILE"
-fi
+}
 
-# CLI alternatives
-echo "Setting PHP ${PHP_VERSION} as default CLI..."
-if [ -f "/usr/bin/php${PHP_VERSION}" ]; then
-    update-alternatives --set php "/usr/bin/php${PHP_VERSION}" || \
-        update-alternatives --install /usr/bin/php php "/usr/bin/php${PHP_VERSION}" 100
-    update-alternatives --set phar "/usr/bin/phar${PHP_VERSION}" 2>/dev/null || true
-    update-alternatives --set phar.phar "/usr/bin/phar.phar${PHP_VERSION}" 2>/dev/null || true
-else
-    echo "⚠ PHP ${PHP_VERSION} binary not found at /usr/bin/php${PHP_VERSION}" | tee -a "$LOG_FILE"
-    echo "⚠ PHP installation may have failed" | tee -a "$LOG_FILE"
-fi
+update_alternatives "$PHP_VERSION"
 
-# php.ini tweaks
-CLI_PHP_INI="/etc/php/${PHP_VERSION}/cli/php.ini"
-if [ -f "$CLI_PHP_INI" ] && ! grep -q "apc.enable_cli=1" "$CLI_PHP_INI"; then
-    echo "apc.enable_cli=1" >>"$CLI_PHP_INI"
-fi
+# --- Composer ---
 
-restart_apache || true
+install_composer() {
+    if command -v composer >/dev/null 2>&1 && [[ "$FORCE_MODE" == "false" ]]; then
+        info "Composer already installed."
+        return
+    fi
 
-echo "✓ Switched to PHP ${PHP_VERSION}"
-echo "✓ PHP CLI version switched"
+    info "Installing/Updating Composer..."
+    EXPECTED_CHECKSUM="$(php -r 'copy("https://composer.github.io/installer.sig", "php://stdout");')"
+    php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+    ACTUAL_CHECKSUM="$(php -r "echo hash_file('sha384', 'composer-setup.php');")"
 
-# Config tuning
-echo "Configuring PHP settings..."
-TOTAL_RAM_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo || echo 0)
-if [ "$TOTAL_RAM_KB" -gt 0 ]; then
-  RAM_75_MB=$((TOTAL_RAM_KB * 3 / 4 / 1024))
-    MEMORY_LIMIT="${RAM_75_MB}M"
-else
-    MEMORY_LIMIT="1024M"
-fi
+    if [[ "$EXPECTED_CHECKSUM" != "$ACTUAL_CHECKSUM" ]]; then
+        rm composer-setup.php
+        error "Composer installer corrupt"
+        return 1
+    fi
 
-desired_error_reporting="error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT & ~E_NOTICE & ~E_WARNING"
-desired_post_max_size="post_max_size = 1G"
-desired_upload_max_filesize="upload_max_filesize = 1G"
-desired_memory_limit="memory_limit = ${MEMORY_LIMIT}"
-desired_strict_mode="session.use_strict_mode = 1"
-desired_max_execution_time="max_execution_time = 300"
+    php composer-setup.php --quiet --install-dir=/usr/local/bin --filename=composer
+    rm composer-setup.php
+    chmod +x /usr/local/bin/composer
+}
 
-for phpini in "/etc/php/${PHP_VERSION}/apache2/php.ini" "/etc/php/${PHP_VERSION}/cli/php.ini"; do
-    [ -f "$phpini" ] || continue
-    echo "Updating $phpini..."
-    awk -v er="$desired_error_reporting" -v pms="$desired_post_max_size" \
-        -v umf="$desired_upload_max_filesize" -v ml="$desired_memory_limit" \
-        -v dsm="$desired_strict_mode" -v met="$desired_max_execution_time" \
-        '{
-            if ($0 ~ /^error_reporting[[:space:]]*=/)         {print ";" $0 "\n" er;  next}
-            if ($0 ~ /^post_max_size[[:space:]]*=/)           {print ";" $0 "\n" pms; next}
-            if ($0 ~ /^upload_max_filesize[[:space:]]*=/)     {print ";" $0 "\n" umf; next}
-            if ($0 ~ /^memory_limit[[:space:]]*=/)            {print ";" $0 "\n" ml;  next}
-            if ($0 ~ /^session\.use_strict_mode[[:space:]]*=/){print ";" $0 "\n" dsm; next}
-            if ($0 ~ /^max_execution_time[[:space:]]*=/)      {print ";" $0 "\n" met; next}
-            print $0
-        }' "$phpini" >"${phpini}.tmp" && mv "${phpini}.tmp" "$phpini"
-done
+install_composer
 
-# Composer (global, verified)
-COMPOSER_TIMEOUT=60
+# --- Restart Services ---
 
-install_composer_global() {
-    # Verify PHP is available before attempting Composer installation
-    if ! command -v php >/dev/null 2>&1; then
-        echo "⚠ PHP command not found, cannot install Composer" | tee -a "$LOG_FILE"
-        echo "⚠ PHP may not be properly installed or alternatives not set" | tee -a "$LOG_FILE"
+restart_apache_safe() {
+    if [[ ! -d /etc/apache2 ]]; then return; fi
+
+    info "Restarting Apache..."
+    
+    # 1. Syntax check first
+    if ! apache2ctl -t; then
+        error "Apache configuration syntax error! Not restarting to prevent downtime."
+        return 1
+    fi
+
+    # 2. Robust restart with timeout and kill
+    # Try polite restart (20s), then force kill (10s later)
+    if ! timeout -k 10 20 systemctl restart apache2; then
+        error "Apache failed to restart gracefully. Check logs."
+        systemctl status apache2 --no-pager | tail -n 20
         return 1
     fi
     
-    echo "Installing Composer (verified)…"
-    local installer sig actual
-    sig="$(curl -fsSL --max-time 60 https://composer.github.io/installer.sig)" || {
-        echo "Failed to fetch Composer installer signature."
-        return 1
-    }
-    installer="$(mktemp)"
-    curl -fsSL --max-time 60 https://getcomposer.org/installer -o "$installer" || {
-        echo "Failed to download Composer installer."
-        rm -f "$installer"
-        return 1
-    }
-    actual="$(php -r "echo hash_file('sha384', '${installer}');")"
-    if [ "$sig" != "$actual" ]; then
-        echo "Composer installer signature mismatch. Aborting."
-        rm -f "$installer"
-        return 1
-    fi
-    # Use timeout to prevent hanging if the PHP script stalls
-    timeout "$COMPOSER_TIMEOUT" php "$installer" --no-ansi --install-dir=/usr/local/bin --filename=composer || {
-        echo "Composer installation failed or timed out."
-        rm -f "$installer"
-        return 1
-    }
-    rm -f "$installer"
-    chmod 755 /usr/local/bin/composer
-    # Ensure cron/systemd (often lacking /usr/local/bin) can find it:
-    if [ -w /usr/bin ] && [ ! -e /usr/bin/composer ]; then
-        ln -sf /usr/local/bin/composer /usr/bin/composer
-    fi
-    echo "✓ Composer installed at $(/usr/local/bin/composer -V 2>/dev/null || echo /usr/local/bin/composer)"
+    info "Apache restarted successfully."
 }
 
+restart_apache_safe
 
-# Composer
-if [ "$FORCE_MODE" = true ] || ! command -v composer >/dev/null 2>&1; then
-    echo "Setting up Composer (force=${FORCE_MODE})…"
-    if [ "$FORCE_MODE" = true ] && [ -f /usr/local/bin/composer ]; then
-        rm -f /usr/local/bin/composer
-    fi
-    install_composer_global || echo "⚠ Composer setup encountered an issue"
-else
-    echo "✓ Composer already installed (use --force to reinstall)"
+# --- Final Report ---
+
+info "--------------------------------------------------"
+info "PHP Switch Complete"
+info "Current CLI Version: $(php -r 'echo PHP_VERSION;')"
+if [[ -d /etc/apache2 ]]; then
+    info "Apache Module: $(a2query -m | grep 'php' || echo 'None')"
 fi
-
-
-# Final restart
-echo "Final Apache restart..."
-restart_apache || true
-
-echo
-if [ -f /var/log/php-switch-error.log ]; then
-    echo "Installation Issues Found:"
-    echo "------------------------"
-    cat /var/log/php-switch-error.log || true
-else
-    echo "✓ No installation errors detected"
-fi
-
-echo
-echo
-echo "Installation complete! PHP ${PHP_VERSION} is now active."
-echo
+info "--------------------------------------------------"
 
 exit 0

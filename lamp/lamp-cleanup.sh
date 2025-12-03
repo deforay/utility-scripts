@@ -15,7 +15,8 @@ fi
 
 # Purge MySQL, PHP, Apache, and phpMyAdmin
 apt-get purge --auto-remove -y mysql-server mysql-client mysql-common mysql-server-core-* mysql-client-core-*
-apt-get purge --auto-remove -y php* apache2* libapache2-mod-php* phpmyadmin composer
+apt-get purge --auto-remove -y php7.4* php 8.2* php8.3* php8.4* php8.5* php* 
+apt-get purge --auto-remove -y apache2* libapache2-mod-php* phpmyadmin composer
 
 # Stop services before removing files
 systemctl stop apache2 2>/dev/null || true
