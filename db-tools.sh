@@ -3151,7 +3151,7 @@ Configuration:
 Documentation:
   For more information, visit: https://github.com/deforay/utility-scripts
 
-Version: 3.0.0
+Version: 3.1.0
 EOF
 }
 
