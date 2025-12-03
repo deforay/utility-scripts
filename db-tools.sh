@@ -3,7 +3,7 @@
 # Features: backups, PITR, encryption, notifications, health checks, GFS rotation
 #
 # Installation:
-#   sudo curl -fsSL https://raw.githubusercontent.com/deforay/utility-scripts/master/db-tools.sh -o /usr/local/bin/db-tools && sudo chmod +x /usr/local/bin/db-tools
+#   sudo curl -fsSL "https://raw.githubusercontent.com/deforay/utility-scripts/master/db-tools.sh?t=$(date +%s)" -o /usr/local/bin/db-tools && sudo chmod +x /usr/local/bin/db-tools
 #
 # Usage:
 #   db-tools init
