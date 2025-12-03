@@ -2774,8 +2774,17 @@ tune() {
     # 2. Percona Toolkit (pt-variable-advisor)
     if have pt-variable-advisor; then
         log INFO "Running Percona pt-variable-advisor..."
-        # --quiet is not a valid option for pt-variable-advisor
-        "$MYSQL" --login-path="$LOGIN_PATH" -e "SHOW VARIABLES" | pt-variable-advisor - || true
+        # pt-variable-advisor reads from STDIN if no DSN is provided, but we need to be explicit
+        # The previous error "Unknown MySQL server host '-'" suggests it didn't like the pipe or arguments
+        # We will save variables to a temp file and pass that instead
+        
+        local vars_file
+        vars_file=$(mktemp)
+        "$MYSQL" --login-path="$LOGIN_PATH" -e "SHOW VARIABLES" > "$vars_file"
+        
+        pt-variable-advisor "$vars_file" || true
+        
+        rm -f "$vars_file"
     else
         warn "pt-variable-advisor not found (install percona-toolkit)"
     fi
