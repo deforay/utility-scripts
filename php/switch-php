@@ -16,9 +16,12 @@ IFS=$'\n\t'
 # --- Configuration ---
 LOG_FILE="/var/log/php-switch.log"
 LOCK_FILE="/var/lock/php-switch.lock"
-DEBIAN_FRONTEND=noninteractive
 RETRIES=3
 DELAY=5
+
+# Prevent apt from prompting for user input (needrestart dialogs, etc.)
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -258,7 +261,7 @@ configure_php_tuning "$PHP_VERSION"
 
 switch_apache_module() {
     local version="$1"
-    
+
     if [[ ! -d /etc/apache2 ]]; then
         warn "Apache2 not found, skipping module switch."
         return
@@ -266,31 +269,113 @@ switch_apache_module() {
 
     info "Switching Apache to PHP $version..."
 
+    # Verify module files exist before attempting to enable
+    local mod_load="/etc/apache2/mods-available/php${version}.load"
+    local mod_conf="/etc/apache2/mods-available/php${version}.conf"
+
+    if [[ ! -f "$mod_load" ]]; then
+        warn "Apache PHP module file not found: $mod_load"
+        warn "Attempting to reinstall libapache2-mod-php${version}..."
+
+        # Force reinstall the Apache module
+        if ! run_with_retry apt-get install --reinstall -y "libapache2-mod-php${version}"; then
+            fatal "Failed to install Apache PHP module. Check if libapache2-mod-php${version} exists in repository."
+        fi
+
+        # Re-check after reinstall
+        if [[ ! -f "$mod_load" ]]; then
+            fatal "Apache PHP module file still missing after reinstall: $mod_load. Manual intervention required."
+        fi
+        info "Apache PHP module reinstalled successfully."
+    fi
+
     # Disable all other PHP modules
     # We find them dynamically to be robust against any installed version
     local current_modules
-    current_modules=$(a2query -m | grep -o 'php[0-9]\.[0-9]' || true)
+    current_modules=$(a2query -m 2>/dev/null | grep -oE 'php[0-9]+\.[0-9]+' || true)
 
     for mod in $current_modules; do
         if [[ "$mod" != "php${version}" ]]; then
             info "Disabling Apache module: $mod"
-            a2dismod -f "$mod" || true
+            a2dismod -f "$mod" 2>/dev/null || true
         fi
     done
 
     # Enable mpm_prefork if not active (required for mod_php)
     if ! a2query -m mpm_prefork >/dev/null 2>&1; then
-        info "Enabling mpm_prefork..."
-        a2dismod -f mpm_event mpm_worker || true
-        a2enmod mpm_prefork || true
+        info "Enabling mpm_prefork (required for mod_php)..."
+        a2dismod -f mpm_event 2>/dev/null || true
+        a2dismod -f mpm_worker 2>/dev/null || true
+        if ! a2enmod mpm_prefork; then
+            fatal "Failed to enable mpm_prefork. mod_php requires the prefork MPM."
+        fi
     fi
 
     # Enable the target version
     info "Enabling Apache module: php${version}"
-    a2enmod "php${version}"
+    if ! a2enmod "php${version}"; then
+        fatal "Failed to enable php${version} Apache module."
+    fi
+
+    # Verify module is actually enabled
+    if ! a2query -m "php${version}" >/dev/null 2>&1; then
+        fatal "php${version} module appears enabled but a2query reports it as inactive."
+    fi
+
+    info "Apache PHP module php${version} enabled and verified."
 }
 
 switch_apache_module "$PHP_VERSION"
+
+# --- PHP Handler Verification ---
+
+verify_php_handler() {
+    local version="$1"
+
+    if [[ ! -d /etc/apache2 ]]; then
+        return
+    fi
+
+    info "Verifying PHP handler configuration..."
+
+    local handler_conf="/etc/apache2/mods-enabled/php${version}.conf"
+
+    # Check if the handler config symlink exists
+    if [[ ! -f "$handler_conf" ]]; then
+        warn "PHP handler config not linked in mods-enabled."
+
+        # Check if source exists and try to enable
+        if [[ -f "/etc/apache2/mods-available/php${version}.conf" ]]; then
+            info "Enabling PHP handler configuration..."
+            a2enmod "php${version}" 2>/dev/null || true
+        fi
+    fi
+
+    # Verify handler directive exists in enabled configs
+    if ! grep -rq 'application/x-httpd-php' /etc/apache2/mods-enabled/ 2>/dev/null; then
+        warn "PHP handler directive not found. Creating fallback handler config..."
+
+        cat > "/etc/apache2/conf-available/php${version}-handler.conf" <<'HANDLER_EOF'
+# Fallback PHP handler created by switch-php
+<FilesMatch "\.php$">
+    SetHandler application/x-httpd-php
+</FilesMatch>
+<FilesMatch "\.phps$">
+    SetHandler application/x-httpd-php-source
+</FilesMatch>
+HANDLER_EOF
+
+        if a2enconf "php${version}-handler" 2>/dev/null; then
+            info "Fallback PHP handler enabled."
+        else
+            error "Failed to enable fallback PHP handler."
+        fi
+    else
+        info "PHP handler configuration verified."
+    fi
+}
+
+verify_php_handler "$PHP_VERSION"
 
 # --- CLI Alternatives ---
 
@@ -360,6 +445,67 @@ restart_apache_safe() {
 }
 
 restart_apache_safe
+
+# --- PHP Processing Verification ---
+
+verify_php_working() {
+    if [[ ! -d /etc/apache2 ]]; then
+        return 0
+    fi
+
+    # Find a web root to test in
+    local web_root="/var/www/html"
+    if [[ ! -d "$web_root" ]]; then
+        # Try to find DocumentRoot from Apache config
+        web_root=$(grep -rh "DocumentRoot" /etc/apache2/sites-enabled/ 2>/dev/null | head -1 | awk '{print $2}' | tr -d '"')
+        if [[ -z "$web_root" || ! -d "$web_root" ]]; then
+            warn "Cannot determine web root for PHP verification test."
+            return 0
+        fi
+    fi
+
+    local test_file="${web_root}/.php-switch-test-$$.php"
+    local test_token="PHP_SWITCH_OK_$$"
+
+    info "Running PHP processing verification..."
+
+    # Create test file
+    echo "<?php echo '${test_token}'; ?>" > "$test_file"
+    chmod 644 "$test_file"
+
+    # Give Apache a moment to fully initialize
+    sleep 1
+
+    # Test via curl if available
+    if command -v curl >/dev/null 2>&1; then
+        local response
+        response=$(curl -s --max-time 5 "http://127.0.0.1/$(basename "$test_file")" 2>/dev/null || true)
+        rm -f "$test_file"
+
+        if [[ "$response" == "$test_token" ]]; then
+            info "PHP verification: PASSED - PHP code is being processed correctly."
+            return 0
+        elif [[ "$response" == *"<?php"* ]]; then
+            error "PHP verification: FAILED - PHP code is NOT being processed!"
+            error "Apache is serving raw PHP source code instead of executing it."
+            error "Possible causes:"
+            error "  1. PHP module not loaded (check: a2query -m | grep php)"
+            error "  2. Missing PHP handler in Apache config"
+            error "  3. MPM module conflict (mod_php requires mpm_prefork)"
+            return 1
+        else
+            warn "PHP verification: INCONCLUSIVE - Got unexpected response."
+            warn "Response: ${response:0:100}"
+            return 0
+        fi
+    else
+        rm -f "$test_file"
+        warn "curl not available, skipping PHP processing verification."
+        return 0
+    fi
+}
+
+verify_php_working
 
 # --- Final Report ---
 
