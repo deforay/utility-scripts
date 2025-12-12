@@ -464,7 +464,8 @@ verify_php_working() {
         fi
     fi
 
-    local test_file="${web_root}/.php-switch-test-$$.php"
+    # Avoid dotfiles; Apache default security rules often block them.
+    local test_file="${web_root}/php-switch-test-$$.php"
     local test_token="PHP_SWITCH_OK_$$"
 
     info "Running PHP processing verification..."
