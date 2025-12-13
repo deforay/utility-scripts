@@ -352,7 +352,16 @@ verify_php_handler() {
     fi
 
     # Verify handler directive exists in enabled configs
-    if ! grep -rq 'application/x-httpd-php' /etc/apache2/mods-enabled/ /etc/apache2/conf-enabled/ 2>/dev/null; then
+    local handler_found=false
+    if grep -Rq 'SetHandler[[:space:]]\+application/x-httpd-php' /etc/apache2/mods-enabled/ 2>/dev/null; then
+        handler_found=true
+    elif [[ -f "/etc/apache2/conf-enabled/php${version}-handler.conf" ]]; then
+        handler_found=true
+    elif [[ -f "/etc/apache2/conf-available/php${version}-handler.conf" ]]; then
+        handler_found=true
+    fi
+
+    if [[ "$handler_found" == "false" ]]; then
         warn "PHP handler directive not found. Creating fallback handler config..."
 
         cat > "/etc/apache2/conf-available/php${version}-handler.conf" <<'HANDLER_EOF'
