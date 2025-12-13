@@ -352,7 +352,7 @@ verify_php_handler() {
     fi
 
     # Verify handler directive exists in enabled configs
-    if ! grep -rq 'application/x-httpd-php' /etc/apache2/mods-enabled/ 2>/dev/null; then
+    if ! grep -rq 'application/x-httpd-php' /etc/apache2/mods-enabled/ /etc/apache2/conf-enabled/ 2>/dev/null; then
         warn "PHP handler directive not found. Creating fallback handler config..."
 
         cat > "/etc/apache2/conf-available/php${version}-handler.conf" <<'HANDLER_EOF'
@@ -464,11 +464,15 @@ verify_php_working() {
         fi
     fi
 
+    # Try to honor the first ServerName/ServerAlias as Host header to avoid vhost mismatch/redirects
+    local server_name
+    server_name=$(grep -Eh "^\s*Server(Name|Alias)" /etc/apache2/sites-enabled/*.conf 2>/dev/null | awk '{print $2}' | head -1 | tr -d '"')
+
     # Avoid dotfiles; Apache default security rules often block them.
     local test_file="${web_root}/php-switch-test-$$.php"
     local test_token="PHP_SWITCH_OK_$$"
 
-    info "Running PHP processing verification..."
+    info "Running PHP processing verification (web root: ${web_root}${server_name:+, Host: ${server_name}})..."
 
     # Create test file
     echo "<?php echo '${test_token}'; ?>" > "$test_file"
@@ -479,11 +483,23 @@ verify_php_working() {
 
     # Test via curl if available
     if command -v curl >/dev/null 2>&1; then
-        local response
-        response=$(curl -s --max-time 5 "http://127.0.0.1/$(basename "$test_file")" 2>/dev/null || true)
-        rm -f "$test_file"
+        local headers_file body_file status_code url response location_header
+        local -a host_header=()
+        headers_file=$(mktemp)
+        body_file=$(mktemp)
+        url="http://127.0.0.1/$(basename "$test_file")"
 
-        if [[ "$response" == "$test_token" ]]; then
+        if [[ -n "$server_name" ]]; then
+            host_header=(-H "Host: ${server_name}")
+        fi
+
+        status_code=$(curl -s -L --max-time 8 -o "$body_file" -D "$headers_file" -w '%{http_code}' "${host_header[@]}" --insecure "$url" 2>/dev/null || true)
+        response=$(head -c 200 "$body_file")
+        location_header=$(grep -i '^Location:' "$headers_file" | tail -1 | cut -d' ' -f2- | tr -d '\r')
+
+        rm -f "$test_file" "$headers_file" "$body_file"
+
+        if [[ "$response" == *"$test_token"* ]]; then
             info "PHP verification: PASSED - PHP code is being processed correctly."
             return 0
         elif [[ "$response" == *"<?php"* ]]; then
@@ -495,8 +511,13 @@ verify_php_working() {
             error "  3. MPM module conflict (mod_php requires mpm_prefork)"
             return 1
         else
-            warn "PHP verification: INCONCLUSIVE - Got unexpected response."
-            warn "Response: ${response:0:100}"
+            warn "PHP verification: INCONCLUSIVE - HTTP ${status_code}${location_header:+, Location: ${location_header}}."
+            warn "Response (first 200 chars): ${response}"
+            if [[ -n "$server_name" ]]; then
+                warn "Tip: verification uses Host '${server_name}'. If your site forces HTTPS or another hostname, check that apache serves ${url} with that Host header."
+            else
+                warn "Tip: could be a redirect/virtual host mismatch. Configure ServerName or run curl manually to debug."
+            fi
             return 0
         fi
     else
