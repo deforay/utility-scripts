@@ -536,7 +536,8 @@ verify_php_working() {
     fi
 }
 
-verify_php_working
+# Do not hard-fail the whole switch if the HTTP check fails; surface a warning instead.
+verify_php_working || warn "PHP HTTP verification failed; check web root/virtual host setup. See ${LOG_FILE} for details."
 
 # --- Final Report ---
 
