@@ -263,21 +263,24 @@ setup_brotli() {
     print info "Setting up Brotli compression..."
 
     if ! apache2ctl -M | grep -q 'brotli_module'; then
-        print info "Installing Brotli module for Apache..."
-        log_action "Installing Brotli module for Apache..."
-        apt-get install -y brotli
-
-        if [ $? -eq 0 ]; then
-            print info "Enabling Brotli module..."
-            a2enmod brotli
-            service apache2 restart || {
-                print error "Failed to restart Apache after enabling Brotli. Exiting..."
-                exit 1
-            }
+        if dpkg -l | grep -q '^ii  libapache2-mod-brotli '; then
+            print info "libapache2-mod-brotli already installed"
         else
-            print warning "Failed to install Brotli module. Continuing without Brotli support..."
-            log_action "Failed to install Brotli module. Continuing without Brotli support..."
+            print info "Installing libapache2-mod-brotli..."
+            log_action "Installing libapache2-mod-brotli..."
+            apt-get install -y libapache2-mod-brotli || {
+                print warning "Failed to install libapache2-mod-brotli. Continuing without Brotli support..."
+                log_action "Failed to install libapache2-mod-brotli. Continuing without Brotli support..."
+                return
+            }
         fi
+
+        print info "Enabling Brotli module..."
+        a2enmod brotli
+        service apache2 restart || {
+            print error "Failed to restart Apache after enabling Brotli. Exiting..."
+            exit 1
+        }
     else
         print info "Brotli module is already installed and enabled."
         log_action "Brotli module is already installed and enabled."
@@ -355,6 +358,21 @@ get_mysql_password() {
 
     mysql_root_password=""
     mysql_root_password_confirm=""
+
+    # Reuse existing password from ~/.my.cnf when valid
+    if [ -f ~/.my.cnf ]; then
+        mysql_root_password=$(awk -F= '/^password[[:space:]]*=/{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' ~/.my.cnf)
+        if [ -n "$mysql_root_password" ]; then
+            print info "Found existing MySQL credentials in ~/.my.cnf; verifying..."
+            if command -v mysqladmin &>/dev/null && mysqladmin ping -u root -p"${mysql_root_password}" &>/dev/null; then
+                print success "Reusing MySQL root password from ~/.my.cnf"
+                return
+            else
+                print warning "Existing ~/.my.cnf password did not work; prompting for a new one."
+                mysql_root_password=""
+            fi
+        fi
+    fi
 
     while :; do
         while [ -z "${mysql_root_password}" ] || [ "${mysql_root_password}" != "${mysql_root_password_confirm}" ]; do
