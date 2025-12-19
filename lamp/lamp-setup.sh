@@ -532,7 +532,7 @@ EOF
 #=============================================================================
 
 install_php() {
-    local php_version=${1:-8.2}
+    local php_version=${1:-8.4}
     local force_flag=${2:-}
     print header "Installing and configuring PHP $php_version..."
 
@@ -651,7 +651,7 @@ main() {
     trap 'error_handling "${BASH_COMMAND}" "$LINENO" "$?"' ERR
 
     # Parse arguments
-    local PHP_VERSION=${1:-8.2}
+    local PHP_VERSION=${1:-8.4}
     local FORCE_FLAG=""
 
     # Check for force flag in any position
@@ -665,7 +665,7 @@ main() {
 
     # If force flag is present and first arg is the flag, use default PHP version
     if [ "$1" = "-f" ] || [ "$1" = "--force" ]; then
-        PHP_VERSION="8.2"
+        PHP_VERSION="8.4"
     fi
 
     print header "Starting LAMP Setup Script"
