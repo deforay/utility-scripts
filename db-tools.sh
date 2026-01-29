@@ -2,7 +2,7 @@
 #===============================================================================
 #
 #   db-tools.sh — MySQL/MariaDB Administration Toolkit
-#   Version: 3.2.0
+#   Version: 3.2.1
 #
 #   A comprehensive backup, restore, and maintenance solution for MySQL/MariaDB
 #   with support for XtraBackup, point-in-time recovery, encryption, and more.
@@ -308,6 +308,9 @@
 #===============================================================================
 
 set -euo pipefail
+
+# Version
+DB_TOOLS_VERSION="3.2.1"
 
 # ========================== Configuration ==========================
 CONFIG_FILE="${CONFIG_FILE:-/etc/db-tools.conf}"
@@ -4011,7 +4014,7 @@ Configuration:
 Documentation:
   For more information, visit: https://github.com/deforay/utility-scripts
 
-Version: 3.2.0
+Version: $DB_TOOLS_VERSION
 EOF
 }
 
@@ -4133,6 +4136,9 @@ case "$cmd" in
         ;;
     genkey|generate-key)
         generate_encryption_key "${1:-$ENCRYPTION_KEY_FILE}"
+        ;;
+    version|-v|--version)
+        echo "db-tools version $DB_TOOLS_VERSION"
         ;;
     help|-h|--help|"")
         usage
