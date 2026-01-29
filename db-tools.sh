@@ -310,7 +310,7 @@
 set -euo pipefail
 
 # Version
-DB_TOOLS_VERSION="3.3.6"
+DB_TOOLS_VERSION="3.3.7"
 
 # ========================== Configuration ==========================
 CONFIG_FILE="${CONFIG_FILE:-/etc/db-tools.conf}"
@@ -854,14 +854,15 @@ stack_trap 'print_summary' EXIT
 declare -g OPERATION_IN_PROGRESS=""
 declare -g MYSQL_WAS_STOPPED=0
 declare -g DATADIR_BACKUP_PATH=""
+declare -g EXPECTED_ERROR_EXIT=0  # Set to 1 when returning error intentionally (e.g., partial backup success)
 
 # Critical cleanup on exit/interrupt
 emergency_cleanup() {
     local exit_code=$?
     local signal="${1:-EXIT}"
-    
-    # Only log error if this is an actual error (not normal exit)
-    if [[ $exit_code -ne 0 ]]; then
+
+    # Only log error if this is an actual unexpected error (not normal exit or expected error)
+    if [[ $exit_code -ne 0 ]] && [[ "$EXPECTED_ERROR_EXIT" != "1" ]]; then
         log ERROR "Emergency cleanup triggered (signal: $signal, exit code: $exit_code)"
     fi
     
@@ -2692,15 +2693,15 @@ OPTS
             create_checksum "$out"
             
             # Quick validation - check if backup is readable and contains MySQL dump header
-            # Note: Use subshell to isolate pipefail - head causes SIGPIPE on large files
+            # Use subshell with pipefail disabled to avoid SIGPIPE issues with head
             local decomp_cmd="$(decompressor "$out")"
             local header
             if [[ "$ENCRYPT_BACKUPS" == "1" ]]; then
-                header=$(decrypt_if_encrypted "$out" < "$out" | $decomp_cmd 2>/dev/null | head -n 50) || true
+                header=$(set +o pipefail; decrypt_if_encrypted "$out" < "$out" | $decomp_cmd 2>/dev/null | head -n 50)
             else
-                header=$($decomp_cmd < "$out" 2>/dev/null | head -n 50) || true
+                header=$(set +o pipefail; $decomp_cmd < "$out" 2>/dev/null | head -n 50)
             fi
-            if ! echo "$header" | grep -q "^-- MySQL dump"; then
+            if ! printf '%s' "$header" | grep -q "^-- MySQL dump"; then
                 warn "Backup validation failed: $db"
                 return 1
             fi
@@ -2807,6 +2808,7 @@ OPTS
         warn "Backup completed with $errors error(s)"
         add_summary "Full backup: $completed OK, $errors failed"
         notify "Backup completed with errors" "Completed: $completed, Failed: $errors" "error"
+        EXPECTED_ERROR_EXIT=1  # Partial success, not an emergency
         return 1
     fi
 
