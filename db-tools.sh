@@ -310,7 +310,7 @@
 set -euo pipefail
 
 # Version
-DB_TOOLS_VERSION="3.3.3"
+DB_TOOLS_VERSION="3.3.4"
 
 # ========================== Configuration ==========================
 CONFIG_FILE="${CONFIG_FILE:-/etc/db-tools.conf}"
@@ -1703,7 +1703,7 @@ cleanup_partial_files() {
         if (( age > 3600 )); then
             log INFO "Removing orphaned partial file: $(basename "$f")"
             rm -f "$f"
-            ((count++))
+            ((count++)) || true
         fi
     done < <(find "$BACKUP_DIR" -maxdepth 1 -name "*.partial" -type f 2>/dev/null)
 
@@ -1720,7 +1720,7 @@ cleanup_partial_files() {
         if (( age > 3600 )); then
             log INFO "Removing orphaned temp directory: $(basename "$d")"
             rm -rf "$d"
-            ((count++))
+            ((count++)) || true
         fi
     done < <(find "$BACKUP_DIR" -maxdepth 1 -type d \( -name ".xtra_*" -o -name ".job_status.*" \) 2>/dev/null)
 
@@ -1796,7 +1796,7 @@ count_backups_per_db() {
     for f in "$BACKUP_DIR"/"$db"-*.sql.*; do
         [[ -f "$f" ]] || continue
         [[ "$f" =~ \.(sha256|meta)$ ]] && continue
-        ((count++))
+        ((count++)) || true
     done
     echo "$count"
 }
@@ -2746,7 +2746,7 @@ OPTS
         for db in "${DBS[@]}"; do
           # acquire a token (blocks if pool is empty)
           read -r -u 3 _
-          ((job_num++))
+          ((job_num++)) || true
 
           {
             # run one dump
@@ -2782,20 +2782,20 @@ OPTS
         for sf in "$status_dir"/job_*.status; do
             [[ -f "$sf" ]] || continue
             if grep -q "ok" "$sf" 2>/dev/null; then
-                ((completed++))
+                ((completed++)) || true
             else
-                ((errors++))
+                ((errors++)) || true
             fi
         done
-        
+
         # Show final progress
         show_progress "$completed" "${#DBS[@]}" "Backup"
     else
         for db in "${DBS[@]}"; do
             if dump_one "$db"; then
-                ((completed++))
+                ((completed++)) || true
             else
-                ((errors++))
+                ((errors++)) || true
             fi
             show_progress "$completed" "${#DBS[@]}" "Backup"
         done
