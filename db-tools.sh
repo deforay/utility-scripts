@@ -1081,7 +1081,7 @@ need_tooling() {
             fi
             
             # Check if auto-install is enabled
-            if [[ "${AUTO_INSTALL:-0}" != "1" ]]; then
+            if [[ "$AUTO_INSTALL" != "1" ]]; then
                 warn "XtraBackup not found. Set AUTO_INSTALL=1 to enable auto-install, or install manually."
                 warn "Falling back to mysqldump for this operation."
                 BACKUP_METHOD="mysqldump"
@@ -1111,19 +1111,28 @@ ensure_compression_tools() {
         pigz)
             if ! have pigz; then
                 warn "pigz not found, attempting install..."
-                install_package pigz || warn "Failed to install pigz, falling back to gzip"
+                if ! install_package pigz; then
+                    warn "Failed to install pigz, falling back to gzip"
+                    COMPRESS_ALGO="gzip"
+                fi
             fi
             ;;
         zstd)
             if ! have zstd; then
                 warn "zstd not found, attempting install..."
-                install_package zstd || warn "Failed to install zstd, falling back to gzip"
+                if ! install_package zstd; then
+                    warn "Failed to install zstd, falling back to gzip"
+                    COMPRESS_ALGO="gzip"
+                fi
             fi
             ;;
         xz)
             if ! have xz; then
-                warn "xz-utils not found"
-                install_package xz-utils || install_package xz || warn "Failed to install xz; falling back to gzip"
+                warn "xz-utils not found, attempting install..."
+                if ! install_package xz-utils && ! install_package xz; then
+                    warn "Failed to install xz, falling back to gzip"
+                    COMPRESS_ALGO="gzip"
+                fi
             fi
             ;;
     esac
