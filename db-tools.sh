@@ -310,7 +310,7 @@
 set -euo pipefail
 
 # Version
-DB_TOOLS_VERSION="3.3.5"
+DB_TOOLS_VERSION="3.3.6"
 
 # ========================== Configuration ==========================
 CONFIG_FILE="${CONFIG_FILE:-/etc/db-tools.conf}"
@@ -558,28 +558,25 @@ show_progress() {
     local current="$1"
     local total="$2"
     local desc="${3:-Progress}"
-    local width=42
-    
+    local width=30
+
     [[ "$total" -eq 0 ]] && return
-    
+
     # Cap current at total to prevent overflow
     [[ "$current" -gt "$total" ]] && current="$total"
-    
+
     local pct=$(( current * 100 / total ))
     local filled=$(( width * current / total ))
     local empty=$(( width - filled ))
 
-    # ▓ bar if TTY; plain if not
+    # Build progress bar string
+    local bar=""
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty; i++)); do bar+="░"; done
+
     if is_tty; then
-        printf '\r%s: [%*s%*s] %3d%% (%d/%d)' \
-          "$desc" \
-          "$filled" '' \
-          "$empty" '' \
-          "$pct" "$current" "$total" >&2
-        # replace spaces in the filled section with █
-        printf '\e[%dD' $(( 1 + 1 + 1 + empty + 6 + ${#desc} + 4 )) >&2
-        printf '\e[%dC' $(( ${#desc} + 3 )) >&2
-        printf '%*s' "$filled" '' | tr ' ' '█' >&2
+        # Simple carriage return - no complex cursor movement
+        printf '\r%s: [%s] %3d%% (%d/%d)   ' "$desc" "$bar" "$pct" "$current" "$total" >&2
     else
         printf '%s: %d/%d (%d%%)\n' "$desc" "$current" "$total" "$pct" >&2
     fi
@@ -2695,17 +2692,17 @@ OPTS
             create_checksum "$out"
             
             # Quick validation - check if backup is readable and contains MySQL dump header
+            # Note: Use subshell to isolate pipefail - head causes SIGPIPE on large files
             local decomp_cmd="$(decompressor "$out")"
+            local header
             if [[ "$ENCRYPT_BACKUPS" == "1" ]]; then
-                if ! decrypt_if_encrypted "$out" < "$out" | $decomp_cmd | head -n 50 | grep -q "^-- MySQL dump" 2>/dev/null; then
-                    warn "Backup validation failed: $db"
-                    return 1
-                fi
+                header=$(decrypt_if_encrypted "$out" < "$out" | $decomp_cmd 2>/dev/null | head -n 50) || true
             else
-                if ! $decomp_cmd < "$out" | head -n 50 | grep -q "^-- MySQL dump" 2>/dev/null; then
-                    warn "Backup validation failed: $db"
-                    return 1
-                fi
+                header=$($decomp_cmd < "$out" 2>/dev/null | head -n 50) || true
+            fi
+            if ! echo "$header" | grep -q "^-- MySQL dump"; then
+                warn "Backup validation failed: $db"
+                return 1
             fi
             
             log INFO "✅ $db → $(basename "$out")"
