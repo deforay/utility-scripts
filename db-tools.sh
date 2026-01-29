@@ -332,7 +332,7 @@ MYSQL_DEFAULTS_FILE="${MYSQL_DEFAULTS_FILE:-/etc/db-tools.my.cnf}"  # for XtraBa
 
 
 # Compression settings
-COMPRESS_ALGO="${COMPRESS_ALGO:-pigz}"  # pigz, gzip, zstd, xz
+COMPRESS_ALGO="${COMPRESS_ALGO:-zstd}"  # zstd, pigz, gzip, xz
 COMPRESS_LEVEL="${COMPRESS_LEVEL:-6}"
 
 # Backup types and retention
@@ -2093,7 +2093,7 @@ BACKUP_DIR="$BACKUP_DIR"
 RETENTION_DAYS=${RETENTION_DAYS:-7}
 LOGIN_PATH="$LOGIN_PATH"
 BACKUP_METHOD="${BACKUP_METHOD:-xtrabackup}"
-COMPRESS_ALGO="${COMPRESS_ALGO:-pigz}"
+COMPRESS_ALGO="${COMPRESS_ALGO:-zstd}"
 
 # Space management
 SPACE_AUTO_CLEANUP=1
@@ -3897,8 +3897,8 @@ BACKUP_DIR="/var/backups/mysql"
 RETENTION_DAYS=7
 PARALLEL_JOBS=2
 
-# Compression (pigz, gzip, zstd, xz)
-COMPRESS_ALGO="pigz"
+# Compression (zstd, pigz, gzip, xz)
+COMPRESS_ALGO="zstd"
 COMPRESS_LEVEL=6
 
 # XtraBackup (physical backups - faster for InnoDB)
