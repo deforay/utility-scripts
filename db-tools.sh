@@ -310,7 +310,7 @@
 set -euo pipefail
 
 # Version
-DB_TOOLS_VERSION="3.3.13"
+DB_TOOLS_VERSION="3.3.14"
 
 # ========================== Configuration ==========================
 CONFIG_FILE="${CONFIG_FILE:-/etc/db-tools.conf}"
@@ -1280,16 +1280,36 @@ install_xtrabackup() {
 install_package() {
     local pkg="$1"
     [[ "$EUID" -ne 0 ]] && { warn "Cannot auto-install without root"; return 1; }
-    
+
+    log INFO "Installing $pkg..."
     if have apt-get; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -y >/dev/null 2>&1 || true
-        apt-get install -y "$pkg" >/dev/null 2>&1
+        if apt-get install -y "$pkg" >/dev/null 2>&1; then
+            log INFO "✅ $pkg installed"
+            return 0
+        else
+            warn "apt-get install $pkg failed"
+            return 1
+        fi
     elif have yum; then
-        yum -y install "$pkg" >/dev/null 2>&1
+        if yum -y install "$pkg" >/dev/null 2>&1; then
+            log INFO "✅ $pkg installed"
+            return 0
+        else
+            warn "yum install $pkg failed"
+            return 1
+        fi
     elif have dnf; then
-        dnf -y install "$pkg" >/dev/null 2>&1
+        if dnf -y install "$pkg" >/dev/null 2>&1; then
+            log INFO "✅ $pkg installed"
+            return 0
+        else
+            warn "dnf install $pkg failed"
+            return 1
+        fi
     else
+        warn "No supported package manager found"
         return 1
     fi
 }
