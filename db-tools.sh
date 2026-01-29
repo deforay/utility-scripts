@@ -19,7 +19,12 @@
 #   • Parallel compression (pigz, zstd, xz, gzip)
 #   • SHA256 checksums for integrity verification
 #   • Email and webhook notifications
-#   • Automatic cleanup with configurable retention
+#   • Smart space management:
+#     - Auto-cleanup old backups when space is low
+#     - Size-based retention (max total backup size)
+#     - Disk usage warnings at configurable thresholds
+#     - Automatic cleanup of orphaned partial files
+#     - Minimum free space enforcement
 #   • Database health checks and tuning advisors
 #   • Safe mode: auto-detects risky conditions (low disk, peak hours)
 #
@@ -28,8 +33,7 @@
 #   INSTALLATION
 #   ------------
 #   # One-line install:
-#   sudo curl -fsSL "https://raw.githubusercontent.com/deforay/utility-scripts/master/db-tools.sh" \
-#       -o /usr/local/bin/db-tools && sudo chmod +x /usr/local/bin/db-tools
+#   sudo curl -fsSL "https://raw.githubusercontent.com/deforay/utility-scripts/master/db-tools.sh" -o /usr/local/bin/db-tools && sudo chmod +x /usr/local/bin/db-tools
 #
 #   # Or clone the repository:
 #   git clone https://github.com/deforay/utility-scripts.git
@@ -205,6 +209,46 @@
 #
 #===============================================================================
 #
+#   SPACE MANAGEMENT
+#   ----------------
+#   The script includes smart disk space management:
+#
+#   View space usage:
+#   $ sudo db-tools space
+#
+#   Auto-Cleanup Before Backup:
+#   ---------------------------
+#   When SPACE_AUTO_CLEANUP=1 (default), the script automatically removes
+#   old backups if there isn't enough space for a new backup. It respects
+#   CLEAN_KEEP_MIN to always keep a minimum number of backups per database.
+#
+#   Size-Based Retention:
+#   ---------------------
+#   Set SPACE_MAX_USAGE_GB to limit total backup storage:
+#   $ export SPACE_MAX_USAGE_GB=100  # Max 100GB for backups
+#
+#   Disk Usage Alerts:
+#   ------------------
+#   - Warning at SPACE_WARNING_PERCENT (default: 70%)
+#   - Critical at SPACE_CRITICAL_PERCENT (default: 90%)
+#   - Alerts sent via email/webhook when thresholds exceeded
+#
+#   Partial File Cleanup:
+#   ---------------------
+#   Orphaned .partial files from interrupted backups are automatically
+#   cleaned up on startup (files older than 1 hour).
+#
+#   Configuration:
+#   --------------
+#   SPACE_AUTO_CLEANUP=1        # Enable auto-cleanup (default: 1)
+#   SPACE_MAX_USAGE_GB=0        # Max backup size, 0=unlimited (default: 0)
+#   SPACE_WARNING_PERCENT=70    # Warning threshold (default: 70)
+#   SPACE_CRITICAL_PERCENT=90   # Critical threshold (default: 90)
+#   SPACE_MIN_FREE_GB=5         # Minimum free space to keep (default: 5)
+#   CLEAN_KEEP_MIN=2            # Minimum backups per DB (default: 2)
+#
+#===============================================================================
+#
 #   TROUBLESHOOTING
 #   ---------------
 #   Check health status:
@@ -294,6 +338,15 @@ KEEP_DAILY="${KEEP_DAILY:-7}"
 KEEP_WEEKLY="${KEEP_WEEKLY:-4}"
 KEEP_MONTHLY="${KEEP_MONTHLY:-6}"
 CLEAN_KEEP_MIN="${CLEAN_KEEP_MIN:-2}"
+
+# Smart space management
+SPACE_AUTO_CLEANUP="${SPACE_AUTO_CLEANUP:-1}"       # Auto-remove old backups if space low before backup
+SPACE_MAX_USAGE_GB="${SPACE_MAX_USAGE_GB:-0}"       # Max total backup size in GB (0=unlimited)
+SPACE_MAX_USAGE_PERCENT="${SPACE_MAX_USAGE_PERCENT:-80}"  # Max % of disk to use for backups
+SPACE_WARNING_PERCENT="${SPACE_WARNING_PERCENT:-70}"      # Warn when disk usage exceeds this %
+SPACE_CRITICAL_PERCENT="${SPACE_CRITICAL_PERCENT:-90}"    # Critical alert threshold
+SPACE_MIN_FREE_GB="${SPACE_MIN_FREE_GB:-5}"         # Minimum free GB to keep on disk
+SPACE_CLEANUP_PARTIAL="${SPACE_CLEANUP_PARTIAL:-1}" # Clean orphaned .partial files on startup
 
 # Encryption
 ENCRYPT_BACKUPS="${ENCRYPT_BACKUPS:-0}"
@@ -1583,6 +1636,330 @@ check_backup_space() {
     log INFO "✅ Sufficient disk space available"
 }
 
+# ========================== Smart Space Management ==========================
+
+# Get total size of all backups in MB
+get_backup_total_size_mb() {
+    local total=0
+    shopt -s nullglob
+    for f in "$BACKUP_DIR"/*.sql.* "$BACKUP_DIR"/*.tar "$BACKUP_DIR"/*.tar.* "$BACKUP_DIR"/*.binlog.*; do
+        [[ -f "$f" ]] || continue
+        [[ "$f" =~ \.(sha256|meta)$ ]] && continue
+        local size_mb
+        size_mb=$(du -m "$f" 2>/dev/null | cut -f1 || echo 0)
+        total=$((total + size_mb))
+    done
+    echo "$total"
+}
+
+# Get disk usage percentage for backup directory
+get_disk_usage_percent() {
+    df "$BACKUP_DIR" 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5); print $5}'
+}
+
+# Get free space in GB
+get_free_space_gb() {
+    local free_kb
+    free_kb=$(df "$BACKUP_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
+    echo $((free_kb / 1024 / 1024))
+}
+
+# Clean up orphaned .partial files (failed backups)
+cleanup_partial_files() {
+    [[ "$SPACE_CLEANUP_PARTIAL" != "1" ]] && return 0
+    [[ -d "$BACKUP_DIR" ]] || return 0
+
+    local count=0
+    local now
+    now=$(date +%s)
+
+    while IFS= read -r f; do
+        [[ -f "$f" ]] || continue
+        # Only remove .partial files older than 1 hour (3600 seconds)
+        local mtime
+        if mtime=$(stat -c %Y "$f" 2>/dev/null); then
+            :
+        else
+            mtime=$(stat -f %m "$f" 2>/dev/null || echo "$now")
+        fi
+        local age=$((now - mtime))
+        if (( age > 3600 )); then
+            log INFO "Removing orphaned partial file: $(basename "$f")"
+            rm -f "$f"
+            ((count++))
+        fi
+    done < <(find "$BACKUP_DIR" -maxdepth 1 -name "*.partial" -type f 2>/dev/null)
+
+    # Also clean up temp directories from interrupted XtraBackup operations
+    while IFS= read -r d; do
+        [[ -d "$d" ]] || continue
+        local mtime
+        if mtime=$(stat -c %Y "$d" 2>/dev/null); then
+            :
+        else
+            mtime=$(stat -f %m "$d" 2>/dev/null || echo "$now")
+        fi
+        local age=$((now - mtime))
+        if (( age > 3600 )); then
+            log INFO "Removing orphaned temp directory: $(basename "$d")"
+            rm -rf "$d"
+            ((count++))
+        fi
+    done < <(find "$BACKUP_DIR" -maxdepth 1 -type d \( -name ".xtra_*" -o -name ".job_status.*" \) 2>/dev/null)
+
+    (( count > 0 )) && log INFO "Cleaned up $count orphaned file(s)/directory(s)"
+}
+
+# Check space and send warning notifications
+check_space_warnings() {
+    local usage_percent
+    usage_percent=$(get_disk_usage_percent)
+    local free_gb
+    free_gb=$(get_free_space_gb)
+
+    if (( usage_percent >= SPACE_CRITICAL_PERCENT )); then
+        warn "CRITICAL: Disk usage at ${usage_percent}% (threshold: ${SPACE_CRITICAL_PERCENT}%)"
+        notify "CRITICAL: Backup disk space" \
+               "Disk usage at ${usage_percent}% on $(hostname). Free: ${free_gb}GB. Immediate action required!" \
+               "error"
+        return 2
+    elif (( usage_percent >= SPACE_WARNING_PERCENT )); then
+        warn "WARNING: Disk usage at ${usage_percent}% (threshold: ${SPACE_WARNING_PERCENT}%)"
+        notify "WARNING: Backup disk space low" \
+               "Disk usage at ${usage_percent}% on $(hostname). Free: ${free_gb}GB. Consider cleanup." \
+               "error"
+        return 1
+    fi
+
+    if (( free_gb < SPACE_MIN_FREE_GB )); then
+        warn "WARNING: Only ${free_gb}GB free (minimum: ${SPACE_MIN_FREE_GB}GB)"
+        notify "WARNING: Low free disk space" \
+               "Only ${free_gb}GB free on $(hostname). Minimum required: ${SPACE_MIN_FREE_GB}GB." \
+               "error"
+        return 1
+    fi
+
+    debug "Disk space OK: ${usage_percent}% used, ${free_gb}GB free"
+    return 0
+}
+
+# Get list of backups sorted by age (oldest first)
+get_backups_by_age() {
+    shopt -s nullglob
+    local files=()
+    for f in "$BACKUP_DIR"/*.sql.* "$BACKUP_DIR"/*.tar "$BACKUP_DIR"/*.tar.* "$BACKUP_DIR"/*.binlog.*; do
+        [[ -f "$f" ]] || continue
+        [[ "$f" =~ \.(sha256|meta)$ ]] && continue
+        files+=("$f")
+    done
+
+    # Sort by modification time (oldest first)
+    for f in "${files[@]}"; do
+        local mtime
+        if mtime=$(stat -c %Y "$f" 2>/dev/null); then
+            :
+        else
+            mtime=$(stat -f %m "$f" 2>/dev/null || echo 0)
+        fi
+        echo "$mtime $f"
+    done | sort -n | cut -d' ' -f2-
+}
+
+# Count backups per database
+count_backups_per_db() {
+    local db="$1"
+    local count=0
+    shopt -s nullglob
+    for f in "$BACKUP_DIR"/"$db"-*.sql.*; do
+        [[ -f "$f" ]] || continue
+        [[ "$f" =~ \.(sha256|meta)$ ]] && continue
+        ((count++))
+    done
+    echo "$count"
+}
+
+# Smart cleanup: remove oldest backups to free space
+# Respects CLEAN_KEEP_MIN per database
+smart_cleanup_for_space() {
+    local needed_mb="$1"
+    local freed_mb=0
+    local removed_count=0
+
+    log INFO "Smart cleanup: need to free ${needed_mb}MB"
+
+    # Build list of deletable files (respecting minimum keep per DB)
+    declare -A db_counts=()
+    local deletable_files=()
+
+    # First pass: count backups per database
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        local base
+        base=$(basename "$f")
+        local db="${base%%-[0-9][0-9][0-9][0-9]-*}"
+        if [[ -n "$db" ]]; then
+            db_counts["$db"]=$(( ${db_counts["$db"]:-0} + 1 ))
+        fi
+    done < <(get_backups_by_age)
+
+    # Second pass: mark files as deletable if we have more than CLEAN_KEEP_MIN
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        local base
+        base=$(basename "$f")
+        local db="${base%%-[0-9][0-9][0-9][0-9]-*}"
+
+        # For XtraBackup files, extract differently
+        if [[ "$base" =~ ^xtra-(full|incr)- ]]; then
+            db="__xtrabackup__"
+        fi
+
+        if [[ -n "$db" && ${db_counts["$db"]:-0} -gt $CLEAN_KEEP_MIN ]]; then
+            deletable_files+=("$f")
+            db_counts["$db"]=$(( ${db_counts["$db"]} - 1 ))
+        fi
+    done < <(get_backups_by_age)
+
+    # Delete oldest files until we have enough space
+    for f in "${deletable_files[@]}"; do
+        (( freed_mb >= needed_mb )) && break
+
+        local size_mb
+        size_mb=$(du -m "$f" 2>/dev/null | cut -f1 || echo 0)
+
+        if (( DRY_RUN )); then
+            log INFO "DRY-RUN: Would delete $(basename "$f") (${size_mb}MB)"
+        else
+            log INFO "Deleting for space: $(basename "$f") (${size_mb}MB)"
+            rm -f "$f" "${f}.sha256" 2>/dev/null || true
+
+            # Also remove associated metadata if it exists
+            local ts
+            ts=$(echo "$f" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}' || true)
+            if [[ -n "$ts" ]]; then
+                rm -f "$BACKUP_DIR/backup-$ts.meta" 2>/dev/null || true
+            fi
+        fi
+
+        freed_mb=$((freed_mb + size_mb))
+        ((removed_count++))
+    done
+
+    log INFO "Smart cleanup complete: freed ${freed_mb}MB by removing $removed_count file(s)"
+    echo "$freed_mb"
+}
+
+# Enforce size-based retention (total backup size limit)
+enforce_size_limit() {
+    [[ "$SPACE_MAX_USAGE_GB" -le 0 ]] && return 0
+
+    local max_mb=$((SPACE_MAX_USAGE_GB * 1024))
+    local current_mb
+    current_mb=$(get_backup_total_size_mb)
+
+    if (( current_mb <= max_mb )); then
+        debug "Backup size OK: ${current_mb}MB / ${max_mb}MB"
+        return 0
+    fi
+
+    local excess_mb=$((current_mb - max_mb))
+    log INFO "Backup size ${current_mb}MB exceeds limit ${max_mb}MB, need to free ${excess_mb}MB"
+
+    smart_cleanup_for_space "$excess_mb"
+}
+
+# Pre-backup space check with auto-cleanup
+ensure_space_for_backup() {
+    local estimated_size_mb="$1"
+    local multiplier="${2:-4}"
+    local required_mb=$((estimated_size_mb * multiplier))
+
+    # Clean partial files first
+    cleanup_partial_files
+
+    # Check warnings
+    check_space_warnings || true  # Don't fail, just warn
+
+    # Enforce size limits
+    enforce_size_limit
+
+    # Check if we have enough space
+    local available_mb
+    available_mb=$(df -BM "$BACKUP_DIR" 2>/dev/null | awk 'NR==2 {gsub(/M/,"",$4); print $4}')
+
+    if (( available_mb >= required_mb )); then
+        debug "Sufficient space available: ${available_mb}MB >= ${required_mb}MB"
+        return 0
+    fi
+
+    # Need more space
+    local needed_mb=$((required_mb - available_mb + 1024))  # Add 1GB buffer
+    log INFO "Need ${needed_mb}MB more space for backup"
+
+    if [[ "$SPACE_AUTO_CLEANUP" != "1" ]]; then
+        err "Insufficient space (${available_mb}MB available, ${required_mb}MB needed). Enable SPACE_AUTO_CLEANUP=1 or free space manually."
+    fi
+
+    # Try to free space
+    local freed_mb
+    freed_mb=$(smart_cleanup_for_space "$needed_mb")
+
+    # Re-check
+    available_mb=$(df -BM "$BACKUP_DIR" 2>/dev/null | awk 'NR==2 {gsub(/M/,"",$4); print $4}')
+
+    if (( available_mb < required_mb )); then
+        # Check if we're at minimum keep level
+        warn "Could only free ${freed_mb}MB (keeping minimum $CLEAN_KEEP_MIN backups per database)"
+
+        # Calculate what we have vs need
+        local shortfall=$((required_mb - available_mb))
+
+        if (( available_mb >= estimated_size_mb * 2 )); then
+            # We have at least 2x the estimated size, proceed with warning
+            warn "Proceeding with reduced buffer: ${available_mb}MB available"
+        else
+            err "Cannot free enough space. Have ${available_mb}MB, need ${required_mb}MB. Reduce CLEAN_KEEP_MIN or free space manually."
+        fi
+    fi
+
+    log INFO "✅ Space ready for backup: ${available_mb}MB available"
+}
+
+# Show space usage summary
+show_space_summary() {
+    local total_mb
+    total_mb=$(get_backup_total_size_mb)
+    local total_gb=$((total_mb / 1024))
+    local usage_percent
+    usage_percent=$(get_disk_usage_percent)
+    local free_gb
+    free_gb=$(get_free_space_gb)
+
+    echo "=== Backup Space Summary ==="
+    echo "  Total backup size:    ${total_gb}GB (${total_mb}MB)"
+    echo "  Disk usage:           ${usage_percent}%"
+    echo "  Free space:           ${free_gb}GB"
+
+    if [[ "$SPACE_MAX_USAGE_GB" -gt 0 ]]; then
+        echo "  Size limit:           ${SPACE_MAX_USAGE_GB}GB"
+    fi
+    echo "  Warning threshold:    ${SPACE_WARNING_PERCENT}%"
+    echo "  Critical threshold:   ${SPACE_CRITICAL_PERCENT}%"
+    echo "  Min free space:       ${SPACE_MIN_FREE_GB}GB"
+    echo
+
+    # Count backups
+    local backup_count=0
+    shopt -s nullglob
+    for f in "$BACKUP_DIR"/*.sql.* "$BACKUP_DIR"/*.tar "$BACKUP_DIR"/*.tar.*; do
+        [[ -f "$f" ]] || continue
+        [[ "$f" =~ \.(sha256|meta)$ ]] && continue
+        ((backup_count++))
+    done
+    echo "  Total backup files:   $backup_count"
+    echo "  Minimum keep per DB:  $CLEAN_KEEP_MIN"
+}
+
 # ========================== Progress Functions ==========================
 
 # ========================== Initialization ==========================
@@ -1593,6 +1970,7 @@ init() {
     have mysql_config_editor || err "mysql_config_editor not found"
 
     # -------- Gather inputs with sane defaults --------
+    local backup_dir_input=""
     if [[ -t 0 ]]; then
         read -r -p "MySQL host [localhost]: " host; host=${host:-localhost}
         # trim whitespace
@@ -1606,6 +1984,13 @@ init() {
         user="${user#"${user%%[![:space:]]*}"}"; user="${user%"${user##*[![:space:]]}"}"
 
         read -r -s -p "MySQL password for '$user' (leave blank if none): " pass; echo
+
+        echo
+        read -r -p "Backup directory [$BACKUP_DIR]: " backup_dir_input
+        backup_dir_input="${backup_dir_input:-$BACKUP_DIR}"
+        # trim whitespace
+        backup_dir_input="${backup_dir_input#"${backup_dir_input%%[![:space:]]*}"}"
+        backup_dir_input="${backup_dir_input%"${backup_dir_input##*[![:space:]]}"}"
     else
         # Non-tty: allow env overrides, don't block on reads
         host="${host:-localhost}"
@@ -1613,6 +1998,12 @@ init() {
         [[ "$port" =~ ^[0-9]+$ ]] || err "Invalid port: $port"
         user="${user:-root}"
         pass="${DBTOOLS_PASSWORD:-${MYSQL_PWD:-}}"
+        backup_dir_input="${BACKUP_DIR}"
+    fi
+
+    # Update BACKUP_DIR if a new value was provided
+    if [[ -n "$backup_dir_input" ]]; then
+        BACKUP_DIR="$backup_dir_input"
     fi
 
     [[ -n "$host" ]] || err "Host cannot be empty"
@@ -1659,8 +2050,37 @@ init() {
     mkdir -p "$BACKUP_DIR" "$MARK_DIR" "$LOG_DIR"
     date -Is > "$MARK_INIT"
 
+    # Save essential settings to config file if it doesn't exist or backup dir changed
+    if [[ ! -f "$CONFIG_FILE" ]] || [[ "$BACKUP_DIR" != "/var/backups/mysql" ]]; then
+        log INFO "Saving configuration to $CONFIG_FILE..."
+        local old_umask
+        old_umask=$(umask)
+        umask 077
+        cat > "$CONFIG_FILE" <<INITCONF
+# db-tools configuration (created by init)
+# Edit this file to customize settings, or run: db-tools config
+BACKUP_DIR="$BACKUP_DIR"
+RETENTION_DAYS=${RETENTION_DAYS:-7}
+LOGIN_PATH="$LOGIN_PATH"
+BACKUP_METHOD="${BACKUP_METHOD:-xtrabackup}"
+COMPRESS_ALGO="${COMPRESS_ALGO:-pigz}"
+
+# Space management
+SPACE_AUTO_CLEANUP=1
+SPACE_WARNING_PERCENT=70
+SPACE_CRITICAL_PERCENT=90
+SPACE_MIN_FREE_GB=5
+CLEAN_KEEP_MIN=2
+INITCONF
+        umask "$old_umask"
+        chmod 644 "$CONFIG_FILE" 2>/dev/null || true
+        log INFO "✅ Configuration saved to $CONFIG_FILE"
+    fi
+
     log INFO "✅ Initialization complete"
-    add_summary "Initialized login-path: $LOGIN_PATH; defaults: $MYSQL_DEFAULTS_FILE"
+    log INFO "   Backup directory: $BACKUP_DIR"
+    log INFO "   Config file: $CONFIG_FILE"
+    add_summary "Initialized login-path: $LOGIN_PATH; backup_dir: $BACKUP_DIR"
 }
 
 
@@ -1676,10 +2096,11 @@ backup() {
     ensure_compression_tools
     check_key_perms
     acquire_lock 300 "backup-$backup_type"  # ← Updated with operation name
-    
+
+    # Smart space management: check space, auto-cleanup if needed
     local estimated_size=$(estimate_backup_size)
-    check_disk_space "$BACKUP_DIR" "$estimated_size"
-    
+    ensure_space_for_backup "$estimated_size" 4
+
     case "$backup_type" in
         full)
             if [[ "$BACKUP_METHOD" == "xtrabackup" && -n "$XTRABACKUP" ]]; then
@@ -2959,19 +3380,38 @@ health() {
         ((status++))
     fi
     
-    # Disk space - use MB for precision
+    # Disk space - comprehensive check
     local available_mb
     available_mb=$(df -BM "$BACKUP_DIR" 2>/dev/null | awk 'NR==2 {print $4}' | sed 's/M//' || echo "0")
     local available_gb=$((available_mb / 1024))
-    
-    if (( available_gb > 10 )); then
-        echo "✅ Disk Space: ${available_gb}GB available (${available_mb}MB)"
-    elif (( available_gb > 5 )); then
-        echo "⚠️  Disk Space: ${available_gb}GB available (getting low)"
+    local usage_percent
+    usage_percent=$(get_disk_usage_percent 2>/dev/null || echo "0")
+    local total_backup_mb
+    total_backup_mb=$(get_backup_total_size_mb 2>/dev/null || echo "0")
+    local total_backup_gb=$((total_backup_mb / 1024))
+
+    if (( usage_percent >= SPACE_CRITICAL_PERCENT )); then
+        echo "❌ Disk Space: ${available_gb}GB free, ${usage_percent}% used (CRITICAL!)"
+        ((status++))
+    elif (( usage_percent >= SPACE_WARNING_PERCENT )); then
+        echo "⚠️  Disk Space: ${available_gb}GB free, ${usage_percent}% used (warning)"
+        ((status++))
+    elif (( available_gb < SPACE_MIN_FREE_GB )); then
+        echo "⚠️  Disk Space: ${available_gb}GB free (below ${SPACE_MIN_FREE_GB}GB minimum)"
         ((status++))
     else
-        echo "❌ Disk Space: ${available_gb}GB available (critically low!)"
-        ((status++))
+        echo "✅ Disk Space: ${available_gb}GB free, ${usage_percent}% used"
+    fi
+
+    # Backup size info
+    echo "ℹ️  Total Backup Size: ${total_backup_gb}GB (${total_backup_mb}MB)"
+    if [[ "$SPACE_MAX_USAGE_GB" -gt 0 ]]; then
+        if (( total_backup_gb >= SPACE_MAX_USAGE_GB )); then
+            echo "⚠️  Backup Size Limit: ${total_backup_gb}GB / ${SPACE_MAX_USAGE_GB}GB (exceeded!)"
+            ((status++))
+        else
+            echo "ℹ️  Backup Size Limit: ${total_backup_gb}GB / ${SPACE_MAX_USAGE_GB}GB"
+        fi
     fi
     
     # Last backup
@@ -3433,6 +3873,15 @@ XTRABACKUP_MEMORY="1G"  # Memory for prepare phase
 # GFS Rotation
 CLEAN_KEEP_MIN=2
 
+# Smart Space Management
+SPACE_AUTO_CLEANUP=1              # Auto-remove old backups if space is low
+SPACE_MAX_USAGE_GB=0              # Max total backup size in GB (0=unlimited)
+SPACE_MAX_USAGE_PERCENT=80        # Max disk usage % before warning/cleanup
+SPACE_WARNING_PERCENT=70          # Send warning when disk usage exceeds this
+SPACE_CRITICAL_PERCENT=90         # Critical alert threshold
+SPACE_MIN_FREE_GB=5               # Always keep at least this much free space
+SPACE_CLEANUP_PARTIAL=1           # Clean orphaned .partial files on startup
+
 # Encryption (0=disabled, 1=enabled)
 ENCRYPT_BACKUPS=0
 ENCRYPTION_KEY_FILE="/etc/db-tools-encryption.key"
@@ -3475,14 +3924,15 @@ Commands:
   verify                        Verify backup integrity with checksums
   restore <DB|ALL|file>         Restore (auto-detects backup type)
   list                          List all available backups
-  
+
   health                        Run system health check
   sizes                         Show database and table sizes
+  space                         Show backup space usage summary
   tune                          Run tuning advisors (mysqltuner, pt-variable-advisor)
   tune-parallel                 Show auto-tuned parallel jobs count
   maintain [quick|full]         Run ANALYZE (quick) or OPTIMIZE (full)
   cleanup [days]                Remove old backups (default: RETENTION_DAYS)
-  
+
   config [path]                 Generate sample configuration file
   genkey [path]                 Generate encryption key file
   help                          Show this help message
@@ -3499,7 +3949,16 @@ Environment Variables:
   NOTIFY_WEBHOOK                Webhook URL for notifications
   LOG_LEVEL                     DEBUG, INFO, WARN, ERROR (default: INFO)
   DRY_RUN                       0=off, 1=on (default: 0)
-  
+
+Space Management:
+  SPACE_AUTO_CLEANUP            Auto-cleanup old backups if space low (default: 1)
+  SPACE_MAX_USAGE_GB            Max total backup size in GB, 0=unlimited (default: 0)
+  SPACE_MAX_USAGE_PERCENT       Max disk usage % for backups (default: 80)
+  SPACE_WARNING_PERCENT         Warning threshold % (default: 70)
+  SPACE_CRITICAL_PERCENT        Critical threshold % (default: 90)
+  SPACE_MIN_FREE_GB             Minimum free GB to maintain (default: 5)
+  CLEAN_KEEP_MIN                Minimum backups to keep per DB (default: 2)
+
 PITR (Point-in-Time Recovery):
   UNTIL_TIME="YYYY-MM-DD HH:MM:SS"
   END_POS=<position>
@@ -3600,6 +4059,11 @@ fi
 # Create directories
 mkdir -p "$BACKUP_DIR" "$MARK_DIR" 2>/dev/null || true
 
+# Clean up orphaned partial files on startup (if enabled)
+if [[ -d "$BACKUP_DIR" ]] && [[ "$SPACE_CLEANUP_PARTIAL" == "1" ]]; then
+    cleanup_partial_files 2>/dev/null || true
+fi
+
 # Parse command
 cmd="${1:-}"
 shift || true
@@ -3640,6 +4104,10 @@ case "$cmd" in
         ;;
     cleanup)
         cleanup "${1:-$RETENTION_DAYS}"
+        ;;
+    space)
+        show_space_summary
+        check_space_warnings || true
         ;;
     config)
         generate_config "${1:-$CONFIG_FILE}"
