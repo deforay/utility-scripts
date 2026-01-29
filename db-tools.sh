@@ -2,7 +2,7 @@
 #===============================================================================
 #
 #   db-tools.sh — MySQL/MariaDB Administration Toolkit
-#   Version: 3.2.1
+#   Version: 3.2.2
 #
 #   A comprehensive backup, restore, and maintenance solution for MySQL/MariaDB
 #   with support for XtraBackup, point-in-time recovery, encryption, and more.
@@ -310,7 +310,7 @@
 set -euo pipefail
 
 # Version
-DB_TOOLS_VERSION="3.2.1"
+DB_TOOLS_VERSION="3.2.2"
 
 # ========================== Configuration ==========================
 CONFIG_FILE="${CONFIG_FILE:-/etc/db-tools.conf}"
@@ -1715,7 +1715,9 @@ cleanup_partial_files() {
         fi
     done < <(find "$BACKUP_DIR" -maxdepth 1 -type d \( -name ".xtra_*" -o -name ".job_status.*" \) 2>/dev/null)
 
-    (( count > 0 )) && log INFO "Cleaned up $count orphaned file(s)/directory(s)"
+    if (( count > 0 )); then
+        log INFO "Cleaned up $count orphaned file(s)/directory(s)"
+    fi
 }
 
 # Check space and send warning notifications
@@ -1884,18 +1886,27 @@ enforce_size_limit() {
 
 # Pre-backup space check with auto-cleanup
 ensure_space_for_backup() {
-    local estimated_size_mb="$1"
+    local estimated_size_mb="${1:-0}"
     local multiplier="${2:-4}"
+
+    # Validate inputs
+    [[ "$estimated_size_mb" =~ ^[0-9]+$ ]] || estimated_size_mb=0
+    [[ "$multiplier" =~ ^[0-9]+$ ]] || multiplier=4
+
     local required_mb=$((estimated_size_mb * multiplier))
+    debug "ensure_space_for_backup: estimated=${estimated_size_mb}MB, multiplier=${multiplier}, required=${required_mb}MB"
 
     # Clean partial files first
-    cleanup_partial_files
+    debug "Cleaning partial files..."
+    cleanup_partial_files || true
 
     # Check warnings
+    debug "Checking space warnings..."
     check_space_warnings || true  # Don't fail, just warn
 
     # Enforce size limits
-    enforce_size_limit
+    debug "Enforcing size limits..."
+    enforce_size_limit || true
 
     # Check if we have enough space
     local available_mb
@@ -2117,8 +2128,14 @@ backup() {
     acquire_lock 300 "backup-$backup_type"  # ← Updated with operation name
 
     # Smart space management: check space, auto-cleanup if needed
-    local estimated_size=$(estimate_backup_size)
+    debug "Estimating backup size..."
+    local estimated_size
+    estimated_size=$(estimate_backup_size) || { err "Failed to estimate backup size"; }
+    debug "Estimated size: ${estimated_size}MB"
+
+    debug "Checking space for backup..."
     ensure_space_for_backup "$estimated_size" 4
+    debug "Space check passed"
 
     case "$backup_type" in
         full)
