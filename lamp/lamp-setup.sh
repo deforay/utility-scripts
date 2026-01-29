@@ -268,6 +268,14 @@ setup_brotli() {
         else
             print info "Installing libapache2-mod-brotli..."
             log_action "Installing libapache2-mod-brotli..."
+            # Refresh package lists and confirm availability before install
+            apt-get update -y || true
+            if ! apt-cache show libapache2-mod-brotli >/dev/null 2>&1; then
+                print warning "libapache2-mod-brotli not available in current repos. Skipping Brotli setup."
+                log_action "libapache2-mod-brotli not available in current repos. Skipping Brotli setup."
+                return
+            fi
+
             apt-get install -y libapache2-mod-brotli || {
                 print warning "Failed to install libapache2-mod-brotli. Continuing without Brotli support..."
                 log_action "Failed to install libapache2-mod-brotli. Continuing without Brotli support..."

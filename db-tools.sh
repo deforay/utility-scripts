@@ -1,20 +1,267 @@
 #!/usr/bin/env bash
-# db-tools.sh — MySQL/MariaDB admin toolkit
-# Features: backups, PITR, encryption, notifications, health checks, GFS rotation
+#===============================================================================
 #
-# Installation:
-#   sudo curl -fsSL "https://raw.githubusercontent.com/deforay/utility-scripts/master/db-tools.sh?t=$(date +%s)" -o /usr/local/bin/db-tools && sudo chmod +x /usr/local/bin/db-tools
+#   db-tools.sh — MySQL/MariaDB Administration Toolkit
+#   Version: 3.2.0
 #
-# Usage:
-#   db-tools init
-#   db-tools backup [full|incremental]
-#   db-tools restore <DB|ALL|file.sql.gz> [target-db]
-#   db-tools verify
-#   db-tools health
-#   db-tools sizes
-#   db-tools tune
-#   db-tools maintain [quick|full]
-#   db-tools cleanup [days]
+#   A comprehensive backup, restore, and maintenance solution for MySQL/MariaDB
+#   with support for XtraBackup, point-in-time recovery, encryption, and more.
+#
+#===============================================================================
+#
+#   FEATURES
+#   --------
+#   • Physical backups via XtraBackup/MariaBackup (fast, hot backups)
+#   • Logical backups via mysqldump (portable, cross-version compatible)
+#   • Incremental backups with automatic base detection
+#   • Point-in-Time Recovery (PITR) via binary log replay
+#   • AES-256-GCM encryption for backup files
+#   • Parallel compression (pigz, zstd, xz, gzip)
+#   • SHA256 checksums for integrity verification
+#   • Email and webhook notifications
+#   • Automatic cleanup with configurable retention
+#   • Database health checks and tuning advisors
+#   • Safe mode: auto-detects risky conditions (low disk, peak hours)
+#
+#===============================================================================
+#
+#   INSTALLATION
+#   ------------
+#   # One-line install:
+#   sudo curl -fsSL "https://raw.githubusercontent.com/deforay/utility-scripts/master/db-tools.sh" \
+#       -o /usr/local/bin/db-tools && sudo chmod +x /usr/local/bin/db-tools
+#
+#   # Or clone the repository:
+#   git clone https://github.com/deforay/utility-scripts.git
+#   sudo cp utility-scripts/db-tools.sh /usr/local/bin/db-tools
+#   sudo chmod +x /usr/local/bin/db-tools
+#
+#===============================================================================
+#
+#   QUICK START
+#   -----------
+#   1. Initialize (first-time setup - stores credentials securely):
+#      $ sudo db-tools init
+#
+#   2. Run a backup:
+#      $ sudo db-tools backup
+#
+#   3. Check backup health:
+#      $ sudo db-tools health
+#
+#   4. Set up automated backups (add to root's crontab):
+#      $ sudo crontab -e
+#
+#      # Daily full backup at 2 AM
+#      0 2 * * * /usr/local/bin/db-tools backup full >> /var/log/db-tools/backup.log 2>&1
+#
+#      # Incremental every 6 hours
+#      0 */6 * * * /usr/local/bin/db-tools backup incremental >> /var/log/db-tools/backup.log 2>&1
+#
+#      # Weekly maintenance on Sunday at 3 AM
+#      0 3 * * 0 /usr/local/bin/db-tools maintain full >> /var/log/db-tools/maintain.log 2>&1
+#
+#      # Daily cleanup at 4 AM
+#      0 4 * * * /usr/local/bin/db-tools cleanup >> /var/log/db-tools/cleanup.log 2>&1
+#
+#===============================================================================
+#
+#   COMMANDS
+#   --------
+#   init                        Initialize credentials and install dependencies
+#   backup [full|incremental]   Create backup (XtraBackup by default)
+#   backup logical              Create logical backup (mysqldump)
+#   restore <DB|ALL|file>       Restore from backup (auto-detects type)
+#   verify                      Verify backup integrity
+#   list                        List available backups
+#   health                      Run system health check
+#   sizes                       Show database and table sizes
+#   tune                        Run tuning advisors
+#   maintain [quick|full]       ANALYZE (quick) or OPTIMIZE (full) tables
+#   cleanup [days]              Remove old backups
+#   config [path]               Generate sample config file
+#   genkey [path]               Generate encryption key
+#   status                      Show current operation status
+#   help                        Show help message
+#
+#===============================================================================
+#
+#   CONFIGURATION
+#   -------------
+#   Configuration can be set via:
+#   1. Environment variables (highest priority)
+#   2. Config file: /etc/db-tools.conf
+#   3. Local .env file in current directory
+#
+#   Generate a sample config:
+#   $ sudo db-tools config /etc/db-tools.conf
+#
+#   Key Settings:
+#   -------------
+#   BACKUP_DIR          Backup storage location (default: /var/backups/mysql)
+#   RETENTION_DAYS      Days to keep backups (default: 7)
+#   BACKUP_METHOD       "xtrabackup" or "mysqldump" (default: xtrabackup)
+#   COMPRESS_ALGO       pigz, gzip, zstd, xz (default: pigz)
+#   PARALLEL_JOBS       Parallel backup jobs (default: auto-detected)
+#   LOGIN_PATH          MySQL login path name (default: dbtools)
+#
+#   Encryption:
+#   -----------
+#   ENCRYPT_BACKUPS     0=off, 1=on (default: 0)
+#   ENCRYPTION_KEY_FILE Path to encryption key (default: /etc/db-tools-encryption.key)
+#
+#   # Generate encryption key:
+#   $ sudo db-tools genkey /etc/db-tools-encryption.key
+#
+#   Notifications:
+#   --------------
+#   NOTIFY_EMAIL        Email address for notifications
+#   NOTIFY_WEBHOOK      Webhook URL (receives JSON POST)
+#   NOTIFY_ON           "always", "error", "never" (default: error)
+#
+#   Logging:
+#   --------
+#   LOG_LEVEL           DEBUG, INFO, WARN, ERROR (default: INFO)
+#   USE_SYSLOG          0=off, 1=on (default: 0)
+#
+#===============================================================================
+#
+#   RESTORE EXAMPLES
+#   ----------------
+#   # Restore latest backup of a specific database:
+#   $ sudo db-tools restore mydb
+#
+#   # Restore all databases:
+#   $ sudo db-tools restore ALL
+#
+#   # Restore from a specific backup file:
+#   $ sudo db-tools restore /var/backups/mysql/mydb-2025-01-15-10-00-00.sql.gz
+#
+#   # Restore with database rename:
+#   $ sudo db-tools restore /var/backups/mysql/mydb-backup.sql.gz new_database_name
+#
+#   # Restore XtraBackup (auto-detected):
+#   $ sudo db-tools restore /var/backups/mysql/xtra-full-2025-01-15-10-00-00.tar
+#
+#   Point-in-Time Recovery (PITR):
+#   ------------------------------
+#   # Restore to a specific point in time:
+#   $ UNTIL_TIME="2025-01-15 10:30:00" sudo db-tools restore mydb
+#
+#   # Restore to a specific binlog position:
+#   $ END_POS=12345 sudo db-tools restore mydb
+#
+#   Safety Options:
+#   ---------------
+#   $ DROP_FIRST=1 sudo db-tools restore mydb    # Drop existing DB first
+#   $ FORCE_RESTORE=1 sudo db-tools restore mydb # Skip confirmation prompt
+#
+#===============================================================================
+#
+#   XTRABACKUP VS MYSQLDUMP
+#   -----------------------
+#   XtraBackup (default):
+#   • Hot backup - no table locking for InnoDB
+#   • Faster for large databases
+#   • Supports incremental backups
+#   • Requires same MySQL version for restore
+#
+#   mysqldump:
+#   • Portable across MySQL versions
+#   • Human-readable SQL output
+#   • Better for smaller databases
+#   • Can restore individual tables
+#
+#   To use mysqldump instead:
+#   $ BACKUP_METHOD=mysqldump sudo db-tools backup
+#   # Or set in /etc/db-tools.conf:
+#   BACKUP_METHOD="mysqldump"
+#
+#===============================================================================
+#
+#   MAINTENANCE
+#   -----------
+#   Quick maintenance (ANALYZE only - safe, fast):
+#   $ sudo db-tools maintain quick
+#
+#   Full maintenance (ANALYZE + OPTIMIZE - reclaims disk space):
+#   $ sudo db-tools maintain full
+#
+#   Safe Mode:
+#   ----------
+#   The script auto-detects risky conditions and enables safe mode:
+#   • Low disk space (< 10GB or < 2x largest table)
+#   • Peak hours (8 AM - 8 PM by default)
+#   • High server load (Threads_running > 25)
+#   • Replication lag (> 120 seconds)
+#
+#   In safe mode, OPTIMIZE is skipped to prevent issues.
+#
+#   Override safe mode:
+#   $ sudo db-tools maintain full --force
+#
+#   Force safe mode:
+#   $ sudo db-tools maintain full --safe
+#
+#===============================================================================
+#
+#   TROUBLESHOOTING
+#   ---------------
+#   Check health status:
+#   $ sudo db-tools health
+#
+#   View current operation:
+#   $ sudo db-tools status
+#
+#   Test MySQL connection:
+#   $ mysql --login-path=dbtools -e "SELECT 1"
+#
+#   Re-initialize credentials:
+#   $ sudo db-tools init
+#
+#   Check logs:
+#   $ tail -100 /var/log/db-tools/backup.log
+#
+#   Verify backups:
+#   $ sudo db-tools verify
+#
+#   Common Issues:
+#   --------------
+#   "Login test failed"
+#     → Re-run: sudo db-tools init
+#
+#   "XtraBackup not found"
+#     → Set AUTO_INSTALL=1 or install manually:
+#       apt install mariadb-backup  # MariaDB
+#       apt install percona-xtrabackup-80  # MySQL 8.0
+#
+#   "Insufficient disk space"
+#     → Free up space or reduce RETENTION_DAYS
+#     → Run: sudo db-tools cleanup 3
+#
+#   "Lock timeout"
+#     → Another db-tools instance is running
+#     → Check: sudo db-tools status
+#     → Remove stale lock: sudo rm /var/run/db-tools.lock
+#
+#===============================================================================
+#
+#   SECURITY NOTES
+#   --------------
+#   • Credentials are stored securely via mysql_config_editor (encrypted)
+#   • Backup encryption uses AES-256-GCM (authenticated encryption)
+#   • Key files must have 600 permissions and be owned by root
+#   • Config files are validated for safe ownership before loading
+#   • Database/table names are validated to prevent SQL injection
+#
+#===============================================================================
+#
+#   LICENSE
+#   -------
+#   This script is provided as-is under the MIT License.
+#   https://github.com/deforay/utility-scripts
+#
+#===============================================================================
 
 set -euo pipefail
 
@@ -187,13 +434,8 @@ should_safe_mode() {
   # Free space checks
   local min_free_mb=$(( SAFE_MIN_FREE_GB * 1024 ))
   local ratio_need_mb
-  # ratio * largest_table (rounded up)
-  ratio_need_mb=$(python3 - <<PY 2>/dev/null || echo 0
-r = float("${SAFE_MIN_FREE_RATIO:-2.0}")
-l = int("${largest_mb:-0}")
-print(int(round(r*l)))
-PY
-)
+  # ratio * largest_table (rounded up) - use awk for portable float math
+  ratio_need_mb=$(awk -v r="${SAFE_MIN_FREE_RATIO:-2.0}" -v l="${largest_mb:-0}" 'BEGIN { printf "%d", r * l + 0.5 }')
   (( ratio_need_mb == 0 )) && ratio_need_mb=$(( (largest_mb * 2) ))  # fallback
 
   # Trigger conditions
@@ -379,6 +621,36 @@ debug() { log DEBUG "$@"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 add_summary() { BACKUP_SUMMARY+=("$*"); }
+
+# Validate database/table name to prevent SQL injection
+# MySQL identifiers: alphanumeric, underscore, dollar sign; max 64 chars
+# Reject backticks, quotes, semicolons, and other dangerous chars
+validate_identifier() {
+    local name="$1"
+    local type="${2:-identifier}"  # "database", "table", or "identifier"
+
+    [[ -z "$name" ]] && { warn "Empty $type name"; return 1; }
+
+    # Check length (MySQL max is 64)
+    if (( ${#name} > 64 )); then
+        warn "Invalid $type name (too long): $name"
+        return 1
+    fi
+
+    # Allow only safe characters: alphanumeric, underscore, dollar
+    # Also allow dot for table.name format
+    if [[ ! "$name" =~ ^[a-zA-Z0-9_\$]+(\.[a-zA-Z0-9_\$]+)?$ ]]; then
+        warn "Invalid $type name (unsafe characters): $name"
+        return 1
+    fi
+
+    # Reject reserved/dangerous patterns
+    if [[ "$name" =~ [\`\'\"\;\\] ]]; then
+        err "SECURITY: Dangerous characters in $type name: $name"
+    fi
+
+    return 0
+}
 
 print_summary() {
     [[ ${#BACKUP_SUMMARY[@]} -eq 0 ]] && return
@@ -616,32 +888,42 @@ acquire_lock() {
   fi
 
   # Fallback to manual lock file with timeout and PID checking
+  # Use atomic file creation with noclobber to prevent race conditions
   local elapsed=0
-  while [[ -f "$LOCK_FILE" ]]; do
-    if (( elapsed >= timeout )); then
+  local lock_content="PID:$$ OPERATION:$operation USER:$(whoami) STARTED:$(date '+%Y-%m-%d %H:%M:%S')"
+
+  while true; do
+    # Try atomic lock creation (noclobber prevents overwriting existing file)
+    if (set -o noclobber; echo "$lock_content" > "$LOCK_FILE") 2>/dev/null; then
+      # Successfully created lock file
+      stack_trap 'release_lock' EXIT
+      debug "Lock acquired for '$operation' (PID: $$)"
+      return 0
+    fi
+
+    # Lock file exists, check if it's stale
+    if [[ -f "$LOCK_FILE" ]]; then
       local lock_info=$(cat "$LOCK_FILE" 2>/dev/null || echo "unknown")
-      
-      # Check if the process is still running
+
       if [[ "$lock_info" =~ PID:([0-9]+) ]]; then
         local lock_pid="${BASH_REMATCH[1]}"
         if ! kill -0 "$lock_pid" 2>/dev/null; then
           warn "Stale lock file found (PID $lock_pid not running), removing..."
           rm -f "$LOCK_FILE"
-          break
+          continue  # Retry lock acquisition
         fi
       fi
-      
-      err "Lock timeout: Another instance running for ${elapsed}s. Lock info: $lock_info"
+
+      if (( elapsed >= timeout )); then
+        err "Lock timeout: Another instance running for ${elapsed}s. Lock info: $lock_info"
+      fi
+
+      debug "Waiting for lock... (${elapsed}s) - Held by: $lock_info"
     fi
-    
-    debug "Waiting for lock... (${elapsed}s) - Held by: $(cat "$LOCK_FILE" 2>/dev/null || echo 'unknown')"
+
     sleep 5
     ((elapsed+=5))
   done
-
-  echo "PID:$$ OPERATION:$operation USER:$(whoami) STARTED:$(date '+%Y-%m-%d %H:%M:%S')" > "$LOCK_FILE"
-  stack_trap 'release_lock' EXIT
-  debug "Lock acquired for '$operation' (PID: $$)"
 }
 
 release_lock() {
@@ -666,21 +948,50 @@ is_locked() {
 # ========================== Configuration Loading ==========================
 
 load_config() {
+    # Safe config loader - parses key=value instead of sourcing
+    _safe_load_config() {
+        local file="$1"
+        [[ -f "$file" ]] || return 0
+
+        # Only allow files owned by root or current user with safe permissions
+        local file_owner file_perms
+        if file_owner=$(stat -c '%U' "$file" 2>/dev/null); then
+            file_perms=$(stat -c '%a' "$file" 2>/dev/null)
+        else
+            file_owner=$(stat -f '%Su' "$file" 2>/dev/null || echo "")
+            file_perms=$(stat -f '%Lp' "$file" 2>/dev/null || echo "777")
+        fi
+
+        if [[ -n "$file_owner" && "$file_owner" != "root" && "$file_owner" != "$USER" ]]; then
+            warn "Skipping config file owned by '$file_owner': $file"
+            return 1
+        fi
+
+        # Parse key=value pairs safely (only uppercase alphanumeric + underscore keys)
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            # Skip comments and empty lines
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+
+            # Extract key=value, allowing quoted values
+            if [[ "$line" =~ ^[[:space:]]*([A-Z_][A-Z0-9_]*)[[:space:]]*=[[:space:]]*(.*)[[:space:]]*$ ]]; then
+                local key="${BASH_REMATCH[1]}"
+                local value="${BASH_REMATCH[2]}"
+                # Strip surrounding quotes if present
+                value="${value#\"}" ; value="${value%\"}"
+                value="${value#\'}" ; value="${value%\'}"
+                # Export the variable
+                export "$key=$value"
+            fi
+        done < "$file"
+        debug "Configuration loaded from $file"
+    }
+
     # Load from .env if present (local override)
-    if [[ -f "$ENV_FILE" ]]; then
-        # shellcheck disable=SC1090
-        set -a
-        source "$ENV_FILE"
-        set +a
-        debug "Configuration loaded from $ENV_FILE"
-    fi
+    _safe_load_config "$ENV_FILE"
 
     # Load from system config
-    if [[ -f "$CONFIG_FILE" ]]; then
-        # shellcheck disable=SC1090
-        source "$CONFIG_FILE"
-        debug "Configuration loaded from $CONFIG_FILE"
-    fi
+    _safe_load_config "$CONFIG_FILE"
 }
 
 # ========================== Tool Checking ==========================
@@ -1065,9 +1376,21 @@ notify() {
     fi
     
     if [[ -n "$NOTIFY_WEBHOOK" ]] && have curl; then
+        # Use jq for proper JSON escaping if available, otherwise escape manually
+        local payload
+        if have jq; then
+            payload=$(jq -n --arg s "$subject" --arg m "$message" --arg l "$level" --arg h "$(hostname)" \
+                '{subject: $s, message: $m, level: $l, host: $h}')
+        else
+            # Manual escaping: replace \ with \\, " with \", and newlines
+            local esc_subject esc_message
+            esc_subject=$(printf '%s' "$subject" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')
+            esc_message=$(printf '%s' "$message" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')
+            payload="{\"subject\":\"$esc_subject\",\"message\":\"$esc_message\",\"level\":\"$level\",\"host\":\"$(hostname)\"}"
+        fi
         curl -s -X POST "$NOTIFY_WEBHOOK" \
             -H "Content-Type: application/json" \
-            -d "{\"subject\":\"$subject\",\"message\":\"$message\",\"level\":\"$level\",\"host\":\"$(hostname)\"}" \
+            -d "$payload" \
             >/dev/null 2>&1 || true
     fi
 }
@@ -1604,9 +1927,9 @@ restore_xtra() {
 
     log INFO "Extracting backup..."
     if [[ "$backup_file" =~ \.enc$ ]]; then
-        decrypt_if_encrypted "$backup_file" < "$backup_file" | tar -xzf - -C "$temp_restore"
+        decrypt_if_encrypted "$backup_file" < "$backup_file" | tar -xf - -C "$temp_restore"
     else
-        tar -xzf "$backup_file" -C "$temp_restore"
+        tar -xf "$backup_file" -C "$temp_restore"
     fi
 
     local backup_dir
@@ -1659,9 +1982,9 @@ restore_xtra() {
 
             # extract incremental
             if [[ "$incr" =~ \.enc$ ]]; then
-                decrypt_if_encrypted "$incr" < "$incr" | tar -xzf - -C "$temp_incr"
+                decrypt_if_encrypted "$incr" < "$incr" | tar -xf - -C "$temp_incr"
             else
-                tar -xzf "$incr" -C "$temp_incr"
+                tar -xf "$incr" -C "$temp_incr"
             fi
             local incr_dir
             incr_dir=$(find "$temp_incr" -maxdepth 1 -type d -name "xtra-incr-*" | head -1)
@@ -2029,16 +2352,22 @@ OPTS
 
 backup_incremental() {
     local last_meta="$(ls -1t "$BACKUP_DIR"/backup-*.meta 2>/dev/null | head -1)"
-    
+
     if [[ -z "$last_meta" ]]; then
         warn "No previous full backup found, performing full backup instead"
         backup_full
         return
     fi
-    
-    # shellcheck disable=SC1090
-    source "$last_meta"
-    
+
+    # Safe metadata parsing (don't source untrusted files)
+    local binlog_file="" binlog_pos=""
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        case "$key" in
+            binlog_file) binlog_file="$value" ;;
+            binlog_pos) binlog_pos="$value" ;;
+        esac
+    done < "$last_meta"
+
     if [[ -z "${binlog_file:-}" ]]; then
         err "Last backup metadata incomplete, cannot perform incremental backup"
     fi
@@ -2155,7 +2484,7 @@ verify() {
         # Tar bundles (xtrabackup): try listing
         if [[ "$f" =~ \.tar(\.enc)?$ ]]; then
             if [[ "$f" =~ \.enc$ ]]; then
-                if decrypt_if_encrypted "$f" < "$f" tar -tf - >/dev/null 2>&1; then
+                if decrypt_if_encrypted "$f" < "$f" | tar -tf - >/dev/null 2>&1; then
                     ((ok++)); debug "OK(tar,enc): $base"
                 else
                     ((bad++)); warn "CORRUPT (tar,enc): $base"; continue
@@ -2344,6 +2673,10 @@ restore_file() {
     dest_db="${target_db_opt:-$src_db}"
     dump_ts="$(dump_ts_from_name "$base")"
 
+    # Validate database names to prevent SQL injection
+    validate_identifier "$src_db" "database" || err "Invalid source database name: $src_db"
+    validate_identifier "$dest_db" "database" || err "Invalid target database name: $dest_db"
+
     log INFO "Source DB: $src_db → Target DB: $dest_db"
 
     # Optional DROP safety
@@ -2464,10 +2797,16 @@ run_pitr_local() {
         warn "No metadata found for PITR"
         return 0
     fi
-    
-    # shellcheck disable=SC1090
-    source "$meta"
-    
+
+    # Safe metadata parsing (don't source untrusted files)
+    local binlog_file="" binlog_pos=""
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        case "$key" in
+            binlog_file) binlog_file="$value" ;;
+            binlog_pos) binlog_pos="$value" ;;
+        esac
+    done < "$meta"
+
     if [[ -z "${binlog_file:-}" ]]; then
         warn "No binlog information in metadata"
         return 0
@@ -2847,8 +3186,17 @@ maintain() {
     local idx=0
     for t in "${tables[@]}"; do
         ((idx++))
+        # Validate table name to prevent SQL injection (even though from information_schema)
+        if ! validate_identifier "$t" "table"; then
+            warn "Skipping invalid table name: $t"
+            continue
+        fi
+        # Split schema.table for proper backtick escaping
+        local schema_name table_name
+        schema_name="${t%%.*}"
+        table_name="${t#*.}"
         show_progress "$idx" "${#tables[@]}" "ANALYZE"
-        "$MYSQL" --login-path="$LOGIN_PATH" -e "ANALYZE TABLE ${t};" >/dev/null 2>&1 || warn "ANALYZE failed: $t"
+        "$MYSQL" --login-path="$LOGIN_PATH" -e "ANALYZE TABLE \`${schema_name}\`.\`${table_name}\`;" >/dev/null 2>&1 || warn "ANALYZE failed: $t"
     done
 
     if [[ "$mode" == "full" ]]; then
@@ -2862,22 +3210,27 @@ maintain() {
             idx=0
             for t in "${tables[@]}"; do
                 ((idx++))
+                # Validate table name (already validated in ANALYZE loop, but be defensive)
+                if ! validate_identifier "$t" "table"; then
+                    warn "Skipping invalid table name: $t"
+                    continue
+                fi
                 show_progress "$idx" "${#tables[@]}" "OPTIMIZE"
                 # Check per-table size; skip if free space < ratio * table size
+                # Split schema.table for proper escaping
+                local schema_name table_name
+                schema_name="${t%%.*}"
+                table_name="${t#*.}"
                 local tmb
                 tmb=$("$MYSQL" --login-path="$LOGIN_PATH" -N -e "
                   SELECT COALESCE(ROUND((data_length+index_length)/1024/1024),0)
                   FROM information_schema.TABLES
-                  WHERE CONCAT(TABLE_SCHEMA,'.',TABLE_NAME)='${t}';" 2>/dev/null | awk '{print int($1)}')
+                  WHERE TABLE_SCHEMA='${schema_name}' AND TABLE_NAME='${table_name}';" 2>/dev/null | awk '{print int($1)}')
                 local need_mb
-                need_mb=$(python3 - <<PY 2>/dev/null || echo 0
-r = float("${SAFE_MIN_FREE_RATIO:-2.0}")
-print(int(round(r*${tmb:-0})))
-PY
-)
+                need_mb=$(awk -v r="${SAFE_MIN_FREE_RATIO:-2.0}" -v t="${tmb:-0}" 'BEGIN { printf "%d", r * t + 0.5 }')
                 # If per-table check fails, skip that table
                 if (( free_mb > need_mb )); then
-                    "$MYSQL" --login-path="$LOGIN_PATH" -e "OPTIMIZE TABLE ${t};" >/dev/null 2>&1 || warn "OPTIMIZE failed: $t"
+                    "$MYSQL" --login-path="$LOGIN_PATH" -e "OPTIMIZE TABLE \`${schema_name}\`.\`${table_name}\`;" >/dev/null 2>&1 || warn "OPTIMIZE failed: $t"
                 else
                     warn "Skipping OPTIMIZE for ${t} (free ${free_mb}MB < need ${need_mb}MB)"
                 fi
@@ -2914,10 +3267,39 @@ cleanup() {
   local keep_count
   for db in "${!bydb[@]}"; do
     # Build array of files sorted by modification time (newest first)
+    # Portable approach: use while loop instead of xargs -d (GNU-specific)
     files=()
-    while IFS= read -r line; do
-        [[ -n "$line" ]] && files+=("$line")
-    done < <(printf "%s" "${bydb[$db]}" | sed '/^$/d' | xargs -d '\n' -I{} stat -c "%Y {}" {} 2>/dev/null | sort -rn | cut -d' ' -f2-)
+    while IFS= read -r filepath; do
+        [[ -z "$filepath" ]] && continue
+        local mtime
+        # Try GNU stat first, then BSD stat
+        if mtime=$(stat -c "%Y" "$filepath" 2>/dev/null); then
+            :
+        else
+            mtime=$(stat -f "%m" "$filepath" 2>/dev/null || echo "0")
+        fi
+        echo "$mtime $filepath"
+    done < <(printf "%s" "${bydb[$db]}" | sed '/^$/d') | sort -rn | while IFS= read -r line; do
+        echo "${line#* }"
+    done | while IFS= read -r sorted_file; do
+        [[ -n "$sorted_file" ]] && files+=("$sorted_file")
+    done
+    # Re-read into array (subshell issue workaround)
+    files=()
+    while IFS= read -r sorted_file; do
+        [[ -n "$sorted_file" ]] && files+=("$sorted_file")
+    done < <(
+        while IFS= read -r filepath; do
+            [[ -z "$filepath" ]] && continue
+            local mtime
+            if mtime=$(stat -c "%Y" "$filepath" 2>/dev/null); then
+                :
+            else
+                mtime=$(stat -f "%m" "$filepath" 2>/dev/null || echo "0")
+            fi
+            echo "$mtime $filepath"
+        done < <(printf "%s" "${bydb[$db]}" | sed '/^$/d') | sort -rn | cut -d' ' -f2-
+    )
     
     keep_count=0
     for f in "${files[@]}"; do
@@ -3151,7 +3533,7 @@ Configuration:
 Documentation:
   For more information, visit: https://github.com/deforay/utility-scripts
 
-Version: 3.1.0
+Version: 3.2.0
 EOF
 }
 
