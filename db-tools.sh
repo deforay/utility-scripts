@@ -310,7 +310,7 @@
 set -euo pipefail
 
 # Version
-DB_TOOLS_VERSION="3.3.16"
+DB_TOOLS_VERSION="3.4.0"
 
 # ========================== Configuration ==========================
 CONFIG_FILE="${CONFIG_FILE:-/etc/db-tools.conf}"
@@ -2149,6 +2149,7 @@ INITCONF
 
 backup() {
     local backup_type="${1:-full}"
+    local db_filter="${2:-}"
     
     need_tooling
     require_login
@@ -2166,12 +2167,16 @@ backup() {
     ensure_space_for_backup "$estimated_size" 4
     debug "Space check passed"
 
+    if [[ -n "$db_filter" && "$backup_type" != "logical" && "$BACKUP_METHOD" == "xtrabackup" ]]; then
+        warn "Database filter is only supported for mysqldump; ignoring filter for XtraBackup."
+    fi
+
     case "$backup_type" in
         full)
             if [[ "$BACKUP_METHOD" == "xtrabackup" && -n "$XTRABACKUP" ]]; then
                 backup_xtra_full
             else
-                backup_full
+                backup_full "$db_filter"
             fi
             ;;
         incremental)
@@ -2182,7 +2187,7 @@ backup() {
             fi
             ;;
         logical)
-            backup_full
+            backup_full "$db_filter"
             ;;
         *)
             err "Unknown backup type: $backup_type (use: full, incremental, logical)"
@@ -2636,6 +2641,7 @@ run_pitr_from_position() {
 }
 
 backup_full() {
+    local db_filter="${1:-}"
 
     OPERATION_IN_PROGRESS="mysqldump-full"
     
@@ -2658,6 +2664,14 @@ backup_full() {
             | grep -Ev '^(information_schema|performance_schema|sys|mysql)$' \
             | sort
     )
+
+    if [[ -n "$db_filter" ]]; then
+        validate_identifier "$db_filter" "database" || err "Invalid database name: $db_filter"
+        if ! printf '%s\n' "${DBS[@]}" | grep -qx "$db_filter"; then
+            err "Database not found: $db_filter"
+        fi
+        DBS=("$db_filter")
+    fi
     
     [[ ${#DBS[@]} -gt 0 ]] || { log INFO "No databases to back up"; return 0; }
     
@@ -3991,8 +4005,8 @@ Usage: $0 <command> [options]
 
 Commands:
   init                          Initialize login credentials and tools
-  backup [full|incremental]     Create backup (XtraBackup by default)
-  backup logical                Create logical backup (mysqldump)
+  backup [full|incremental] [db]  Create backup (XtraBackup by default)
+  backup logical [db]             Create logical backup (mysqldump)
   verify                        Verify backup integrity with checksums
   restore <DB|ALL|file>         Restore (auto-detects backup type)
   list                          List all available backups
@@ -4041,6 +4055,9 @@ Examples:
   
   # Create full backup
   $0 backup
+
+  # Create logical backup for a single database
+  $0 backup logical mydb
   
   # Restore specific database
   $0 restore mydb
