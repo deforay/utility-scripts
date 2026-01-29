@@ -310,7 +310,7 @@
 set -euo pipefail
 
 # Version
-DB_TOOLS_VERSION="3.4.0"
+DB_TOOLS_VERSION="3.4.1"
 
 # ========================== Configuration ==========================
 CONFIG_FILE="${CONFIG_FILE:-/etc/db-tools.conf}"
@@ -4162,7 +4162,7 @@ case "$cmd" in
         init "$@"
         ;;
     backup)
-        backup "${1:-full}"
+        backup "$@"
         ;;
     verify)
         verify "$@"
