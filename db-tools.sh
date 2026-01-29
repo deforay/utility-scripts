@@ -310,7 +310,7 @@
 set -euo pipefail
 
 # Version
-DB_TOOLS_VERSION="3.3.4"
+DB_TOOLS_VERSION="3.3.5"
 
 # ========================== Configuration ==========================
 CONFIG_FILE="${CONFIG_FILE:-/etc/db-tools.conf}"
@@ -584,7 +584,9 @@ show_progress() {
         printf '%s: %d/%d (%d%%)\n' "$desc" "$current" "$total" "$pct" >&2
     fi
 
-    [[ "$current" -eq "$total" ]] && { is_tty && echo >&2; }
+    if [[ "$current" -eq "$total" ]] && is_tty; then
+        echo >&2
+    fi
 }
 
 # Create a secure MySQL client defaults file for XtraBackup (non-interactive auth)
