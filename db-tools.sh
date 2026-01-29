@@ -310,7 +310,7 @@
 set -euo pipefail
 
 # Version
-DB_TOOLS_VERSION="3.3.14"
+DB_TOOLS_VERSION="3.3.15"
 
 # ========================== Configuration ==========================
 CONFIG_FILE="${CONFIG_FILE:-/etc/db-tools.conf}"
@@ -2713,18 +2713,17 @@ OPTS
             create_checksum "$out"
             
             # Quick validation - check if backup is readable and contains MySQL dump header
-            # Use timeout to run decompressor for max 2 seconds, write to temp file
+            # Read first 64KB of compressed data and decompress - enough for header check
             local decomp_cmd="$(decompressor "$out")"
-            local header="" header_tmp
-            header_tmp=$(mktemp)
-            if [[ "$ENCRYPT_BACKUPS" == "1" ]]; then
-                ( decrypt_if_encrypted "$out" < "$out" | $decomp_cmd > "$header_tmp" 2>/dev/null ) &
-                local pid=$!; sleep 2; kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
-            else
-                timeout 2 $decomp_cmd < "$out" > "$header_tmp" 2>/dev/null || true
-            fi
-            header=$(head -n 50 "$header_tmp" 2>/dev/null)
-            rm -f "$header_tmp"
+            local header=""
+            header=$(
+                set +e +o pipefail
+                if [[ "$ENCRYPT_BACKUPS" == "1" ]]; then
+                    dd if="$out" bs=65536 count=1 2>/dev/null | decrypt_if_encrypted "$out" | $decomp_cmd 2>/dev/null | head -n 50
+                else
+                    dd if="$out" bs=65536 count=1 2>/dev/null | $decomp_cmd 2>/dev/null | head -n 50
+                fi
+            ) || true
             if ! printf '%s' "$header" | grep -q "^-- MySQL dump"; then
                 warn "Backup validation failed: $db"
                 return 1
