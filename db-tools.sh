@@ -1654,13 +1654,18 @@ get_backup_total_size_mb() {
 
 # Get disk usage percentage for backup directory
 get_disk_usage_percent() {
-    df "$BACKUP_DIR" 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5); print $5}'
+    local pct
+    pct=$(df "$BACKUP_DIR" 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
+    # Return 0 if empty or invalid
+    [[ "$pct" =~ ^[0-9]+$ ]] && echo "$pct" || echo "0"
 }
 
 # Get free space in GB
 get_free_space_gb() {
     local free_kb
     free_kb=$(df "$BACKUP_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
+    # Handle empty or invalid values
+    [[ "$free_kb" =~ ^[0-9]+$ ]] || free_kb=0
     echo $((free_kb / 1024 / 1024))
 }
 
@@ -1712,29 +1717,33 @@ cleanup_partial_files() {
 
 # Check space and send warning notifications
 check_space_warnings() {
-    local usage_percent
+    local usage_percent free_gb
     usage_percent=$(get_disk_usage_percent)
-    local free_gb
     free_gb=$(get_free_space_gb)
 
-    if (( usage_percent >= SPACE_CRITICAL_PERCENT )); then
-        warn "CRITICAL: Disk usage at ${usage_percent}% (threshold: ${SPACE_CRITICAL_PERCENT}%)"
+    # Use defaults if config vars are not set
+    local critical_pct=${SPACE_CRITICAL_PERCENT:-90}
+    local warning_pct=${SPACE_WARNING_PERCENT:-70}
+    local min_free=${SPACE_MIN_FREE_GB:-5}
+
+    if (( usage_percent >= critical_pct )); then
+        warn "CRITICAL: Disk usage at ${usage_percent}% (threshold: ${critical_pct}%)"
         notify "CRITICAL: Backup disk space" \
                "Disk usage at ${usage_percent}% on $(hostname). Free: ${free_gb}GB. Immediate action required!" \
                "error"
         return 2
-    elif (( usage_percent >= SPACE_WARNING_PERCENT )); then
-        warn "WARNING: Disk usage at ${usage_percent}% (threshold: ${SPACE_WARNING_PERCENT}%)"
+    elif (( usage_percent >= warning_pct )); then
+        warn "WARNING: Disk usage at ${usage_percent}% (threshold: ${warning_pct}%)"
         notify "WARNING: Backup disk space low" \
                "Disk usage at ${usage_percent}% on $(hostname). Free: ${free_gb}GB. Consider cleanup." \
                "error"
         return 1
     fi
 
-    if (( free_gb < SPACE_MIN_FREE_GB )); then
-        warn "WARNING: Only ${free_gb}GB free (minimum: ${SPACE_MIN_FREE_GB}GB)"
+    if (( free_gb < min_free )); then
+        warn "WARNING: Only ${free_gb}GB free (minimum: ${min_free}GB)"
         notify "WARNING: Low free disk space" \
-               "Only ${free_gb}GB free on $(hostname). Minimum required: ${SPACE_MIN_FREE_GB}GB." \
+               "Only ${free_gb}GB free on $(hostname). Minimum required: ${min_free}GB." \
                "error"
         return 1
     fi
@@ -1851,7 +1860,9 @@ smart_cleanup_for_space() {
 
 # Enforce size-based retention (total backup size limit)
 enforce_size_limit() {
-    [[ "$SPACE_MAX_USAGE_GB" -le 0 ]] && return 0
+    # Skip if not configured or set to 0/empty
+    [[ -z "${SPACE_MAX_USAGE_GB:-}" ]] && return 0
+    [[ "${SPACE_MAX_USAGE_GB:-0}" -le 0 ]] 2>/dev/null && return 0
 
     local max_mb=$((SPACE_MAX_USAGE_GB * 1024))
     local current_mb
@@ -1886,6 +1897,8 @@ ensure_space_for_backup() {
     # Check if we have enough space
     local available_mb
     available_mb=$(df -BM "$BACKUP_DIR" 2>/dev/null | awk 'NR==2 {gsub(/M/,"",$4); print $4}')
+    # Handle empty or invalid values
+    [[ "$available_mb" =~ ^[0-9]+$ ]] || available_mb=0
 
     if (( available_mb >= required_mb )); then
         debug "Sufficient space available: ${available_mb}MB >= ${required_mb}MB"
@@ -1927,12 +1940,11 @@ ensure_space_for_backup() {
 
 # Show space usage summary
 show_space_summary() {
-    local total_mb
+    local total_mb total_gb usage_percent free_gb
     total_mb=$(get_backup_total_size_mb)
-    local total_gb=$((total_mb / 1024))
-    local usage_percent
+    [[ "$total_mb" =~ ^[0-9]+$ ]] || total_mb=0
+    total_gb=$((total_mb / 1024))
     usage_percent=$(get_disk_usage_percent)
-    local free_gb
     free_gb=$(get_free_space_gb)
 
     echo "=== Backup Space Summary ==="
@@ -1940,12 +1952,12 @@ show_space_summary() {
     echo "  Disk usage:           ${usage_percent}%"
     echo "  Free space:           ${free_gb}GB"
 
-    if [[ "$SPACE_MAX_USAGE_GB" -gt 0 ]]; then
+    if [[ "${SPACE_MAX_USAGE_GB:-0}" -gt 0 ]] 2>/dev/null; then
         echo "  Size limit:           ${SPACE_MAX_USAGE_GB}GB"
     fi
-    echo "  Warning threshold:    ${SPACE_WARNING_PERCENT}%"
-    echo "  Critical threshold:   ${SPACE_CRITICAL_PERCENT}%"
-    echo "  Min free space:       ${SPACE_MIN_FREE_GB}GB"
+    echo "  Warning threshold:    ${SPACE_WARNING_PERCENT:-70}%"
+    echo "  Critical threshold:   ${SPACE_CRITICAL_PERCENT:-90}%"
+    echo "  Min free space:       ${SPACE_MIN_FREE_GB:-5}GB"
     echo
 
     # Count backups
@@ -1969,8 +1981,7 @@ init() {
 
     have mysql_config_editor || err "mysql_config_editor not found"
 
-    # -------- Gather inputs with sane defaults --------
-    local backup_dir_input=""
+    # -------- Gather MySQL credentials --------
     if [[ -t 0 ]]; then
         read -r -p "MySQL host [localhost]: " host; host=${host:-localhost}
         # trim whitespace
@@ -1984,13 +1995,6 @@ init() {
         user="${user#"${user%%[![:space:]]*}"}"; user="${user%"${user##*[![:space:]]}"}"
 
         read -r -s -p "MySQL password for '$user' (leave blank if none): " pass; echo
-
-        echo
-        read -r -p "Backup directory [$BACKUP_DIR]: " backup_dir_input
-        backup_dir_input="${backup_dir_input:-$BACKUP_DIR}"
-        # trim whitespace
-        backup_dir_input="${backup_dir_input#"${backup_dir_input%%[![:space:]]*}"}"
-        backup_dir_input="${backup_dir_input%"${backup_dir_input##*[![:space:]]}"}"
     else
         # Non-tty: allow env overrides, don't block on reads
         host="${host:-localhost}"
@@ -1998,12 +2002,6 @@ init() {
         [[ "$port" =~ ^[0-9]+$ ]] || err "Invalid port: $port"
         user="${user:-root}"
         pass="${DBTOOLS_PASSWORD:-${MYSQL_PWD:-}}"
-        backup_dir_input="${BACKUP_DIR}"
-    fi
-
-    # Update BACKUP_DIR if a new value was provided
-    if [[ -n "$backup_dir_input" ]]; then
-        BACKUP_DIR="$backup_dir_input"
     fi
 
     [[ -n "$host" ]] || err "Host cannot be empty"
@@ -2028,6 +2026,24 @@ init() {
 
     # Also write a secure defaults file for tools like xtrabackup
     write_mysql_defaults_file "$host" "$port" "$user" "$pass"
+
+    # -------- Gather backup settings (after MySQL is configured) --------
+    local backup_dir_input=""
+    if [[ -t 0 ]]; then
+        echo
+        read -r -p "Backup directory [$BACKUP_DIR]: " backup_dir_input
+        backup_dir_input="${backup_dir_input:-$BACKUP_DIR}"
+        # trim whitespace
+        backup_dir_input="${backup_dir_input#"${backup_dir_input%%[![:space:]]*}"}"
+        backup_dir_input="${backup_dir_input%"${backup_dir_input##*[![:space:]]}"}"
+    else
+        backup_dir_input="${BACKUP_DIR}"
+    fi
+
+    # Update BACKUP_DIR if a new value was provided
+    if [[ -n "$backup_dir_input" ]]; then
+        BACKUP_DIR="$backup_dir_input"
+    fi
 
     # -------- Optional helper tooling --------
     log INFO "Installing additional tools..."
@@ -3383,21 +3399,24 @@ health() {
     # Disk space - comprehensive check
     local available_mb
     available_mb=$(df -BM "$BACKUP_DIR" 2>/dev/null | awk 'NR==2 {print $4}' | sed 's/M//' || echo "0")
+    [[ "$available_mb" =~ ^[0-9]+$ ]] || available_mb=0
     local available_gb=$((available_mb / 1024))
     local usage_percent
     usage_percent=$(get_disk_usage_percent 2>/dev/null || echo "0")
+    [[ "$usage_percent" =~ ^[0-9]+$ ]] || usage_percent=0
     local total_backup_mb
     total_backup_mb=$(get_backup_total_size_mb 2>/dev/null || echo "0")
+    [[ "$total_backup_mb" =~ ^[0-9]+$ ]] || total_backup_mb=0
     local total_backup_gb=$((total_backup_mb / 1024))
 
-    if (( usage_percent >= SPACE_CRITICAL_PERCENT )); then
+    if (( usage_percent >= ${SPACE_CRITICAL_PERCENT:-90} )); then
         echo "❌ Disk Space: ${available_gb}GB free, ${usage_percent}% used (CRITICAL!)"
         ((status++))
-    elif (( usage_percent >= SPACE_WARNING_PERCENT )); then
+    elif (( usage_percent >= ${SPACE_WARNING_PERCENT:-70} )); then
         echo "⚠️  Disk Space: ${available_gb}GB free, ${usage_percent}% used (warning)"
         ((status++))
-    elif (( available_gb < SPACE_MIN_FREE_GB )); then
-        echo "⚠️  Disk Space: ${available_gb}GB free (below ${SPACE_MIN_FREE_GB}GB minimum)"
+    elif (( available_gb < ${SPACE_MIN_FREE_GB:-5} )); then
+        echo "⚠️  Disk Space: ${available_gb}GB free (below ${SPACE_MIN_FREE_GB:-5}GB minimum)"
         ((status++))
     else
         echo "✅ Disk Space: ${available_gb}GB free, ${usage_percent}% used"
@@ -3405,7 +3424,7 @@ health() {
 
     # Backup size info
     echo "ℹ️  Total Backup Size: ${total_backup_gb}GB (${total_backup_mb}MB)"
-    if [[ "$SPACE_MAX_USAGE_GB" -gt 0 ]]; then
+    if [[ "${SPACE_MAX_USAGE_GB:-0}" -gt 0 ]] 2>/dev/null; then
         if (( total_backup_gb >= SPACE_MAX_USAGE_GB )); then
             echo "⚠️  Backup Size Limit: ${total_backup_gb}GB / ${SPACE_MAX_USAGE_GB}GB (exceeded!)"
             ((status++))
