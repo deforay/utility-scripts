@@ -105,7 +105,7 @@
 #   BACKUP_DIR          Backup storage location (default: /var/backups/mysql)
 #   RETENTION_DAYS      Days to keep backups (default: 7)
 #   BACKUP_METHOD       "xtrabackup" or "mysqldump" (default: xtrabackup)
-#   COMPRESS_ALGO       pigz, gzip, zstd, xz (default: pigz)
+#   COMPRESS_ALGO       zstd, pigz, gzip, xz (default: zstd)
 #   PARALLEL_JOBS       Parallel backup jobs (default: auto-detected)
 #   LOGIN_PATH          MySQL login path name (default: dbtools)
 #
@@ -310,7 +310,7 @@
 set -euo pipefail
 
 # Version
-DB_TOOLS_VERSION="3.3.12"
+DB_TOOLS_VERSION="3.3.13"
 
 # ========================== Configuration ==========================
 CONFIG_FILE="${CONFIG_FILE:-/etc/db-tools.conf}"
@@ -2102,7 +2102,7 @@ BACKUP_DIR="$BACKUP_DIR"
 RETENTION_DAYS=${RETENTION_DAYS:-7}
 LOGIN_PATH="$LOGIN_PATH"
 BACKUP_METHOD="${BACKUP_METHOD:-xtrabackup}"
-COMPRESS_ALGO="${COMPRESS_ALGO:-zstd}"
+COMPRESS_ALGO="zstd"
 
 # Space management
 SPACE_AUTO_CLEANUP=1
@@ -3995,7 +3995,7 @@ Environment Variables:
   RETENTION_DAYS                Days to keep backups (default: 7)
   LOGIN_PATH                    MySQL login path (default: dbtools)
   PARALLEL_JOBS                 Parallel backup jobs (default: 2)
-  COMPRESS_ALGO                 pigz, gzip, zstd, xz (default: pigz)
+  COMPRESS_ALGO                 zstd, pigz, gzip, xz (default: zstd)
   ENCRYPT_BACKUPS               0=off, 1=on (default: 0)
   CHECKSUM_ENABLED              0=off, 1=on (default: 1)
   NOTIFY_EMAIL                  Email for notifications
