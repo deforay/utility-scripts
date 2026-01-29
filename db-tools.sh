@@ -310,7 +310,7 @@
 set -euo pipefail
 
 # Version
-DB_TOOLS_VERSION="3.3.15"
+DB_TOOLS_VERSION="3.3.16"
 
 # ========================== Configuration ==========================
 CONFIG_FILE="${CONFIG_FILE:-/etc/db-tools.conf}"
@@ -2713,15 +2713,15 @@ OPTS
             create_checksum "$out"
             
             # Quick validation - check if backup is readable and contains MySQL dump header
-            # Read first 64KB of compressed data and decompress - enough for header check
+            # Stream-decompress and read only the first few lines (head will SIGPIPE the decompressor)
             local decomp_cmd="$(decompressor "$out")"
             local header=""
             header=$(
                 set +e +o pipefail
                 if [[ "$ENCRYPT_BACKUPS" == "1" ]]; then
-                    dd if="$out" bs=65536 count=1 2>/dev/null | decrypt_if_encrypted "$out" | $decomp_cmd 2>/dev/null | head -n 50
+                    decrypt_if_encrypted "$out" < "$out" | $decomp_cmd 2>/dev/null | head -n 50
                 else
-                    dd if="$out" bs=65536 count=1 2>/dev/null | $decomp_cmd 2>/dev/null | head -n 50
+                    $decomp_cmd < "$out" 2>/dev/null | head -n 50
                 fi
             ) || true
             if ! printf '%s' "$header" | grep -q "^-- MySQL dump"; then
