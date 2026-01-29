@@ -16,7 +16,7 @@
 #   • Incremental backups with automatic base detection
 #   • Point-in-Time Recovery (PITR) via binary log replay
 #   • AES-256-GCM encryption for backup files
-#   • Parallel compression (pigz, zstd, xz, gzip)
+#   • Compression (pigz, zstd, xz, gzip)
 #   • SHA256 checksums for integrity verification
 #   • Email and webhook notifications
 #   • Smart space management:
@@ -106,7 +106,6 @@
 #   RETENTION_DAYS      Days to keep backups (default: 7)
 #   BACKUP_METHOD       "xtrabackup" or "mysqldump" (default: xtrabackup)
 #   COMPRESS_ALGO       zstd, pigz, gzip, xz (default: zstd)
-#   PARALLEL_JOBS       Parallel backup jobs (default: auto-detected)
 #   LOGIN_PATH          MySQL login path name (default: dbtools)
 #
 #   Encryption:
@@ -310,7 +309,7 @@
 set -euo pipefail
 
 # Version
-DB_TOOLS_VERSION="3.4.1"
+DB_TOOLS_VERSION="3.5.0"
 
 # ========================== Configuration ==========================
 CONFIG_FILE="${CONFIG_FILE:-/etc/db-tools.conf}"
@@ -319,7 +318,6 @@ BACKUP_DIR="${BACKUP_DIR:-/var/backups/mysql}"
 LOG_DIR="${LOG_DIR:-/var/log/db-tools}"
 RETENTION_DAYS="${RETENTION_DAYS:-7}"
 LOGIN_PATH="${LOGIN_PATH:-dbtools}"
-PARALLEL_JOBS="${PARALLEL_JOBS:-2}"
 TOP_N_TABLES="${TOP_N_TABLES:-30}"
 MARK_DIR="/var/lib/dbtools"
 MARK_INIT="$MARK_DIR/init.stamp"
@@ -379,9 +377,7 @@ MYSQLBINLOG="${MYSQLBINLOG:-$(command -v mysqlbinlog || true)}"
 
 # XtraBackup settings
 XTRABACKUP_ENABLED="${XTRABACKUP_ENABLED:-1}"
-XTRABACKUP_PARALLEL="${XTRABACKUP_PARALLEL:-$PARALLEL_JOBS}"
 XTRABACKUP_COMPRESS="${XTRABACKUP_COMPRESS:-1}"
-XTRABACKUP_COMPRESS_THREADS="${XTRABACKUP_COMPRESS_THREADS:-$PARALLEL_JOBS}"
 XTRABACKUP_MEMORY="${XTRABACKUP_MEMORY:-1G}"  # Memory for prepare phase
 BACKUP_METHOD="${BACKUP_METHOD:-xtrabackup}"  # xtrabackup or mysqldump
 XTRABACKUP="${XTRABACKUP:-$(command -v xtrabackup || command -v mariabackup || true)}"
@@ -713,87 +709,6 @@ print_summary() {
     log INFO "=== Operation Summary (${duration}s) ==="
     printf '%s\n' "${BACKUP_SUMMARY[@]}" >&2
 }
-
-# ---------- Auto-tune parallelism ----------
-auto_parallel_jobs() {
-  # If user/config already set a positive int, respect it
-  if [[ -n "${PARALLEL_JOBS:-}" && "${PARALLEL_JOBS}" =~ ^[0-9]+$ && "${PARALLEL_JOBS}" -ge 1 ]]; then
-    echo "$PARALLEL_JOBS"; return 0
-  fi
-
-  # Detect physical CPU availability (respecting cgroup quotas if any)
-  local host_cpus cfs_quota cfs_period cgroup_cpus
-  host_cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)
-
-  # cgroup v2
-  if [[ -r /sys/fs/cgroup/cpu.max ]]; then
-    # Format: "<quota> <period>" or "max <period>"
-    read -r cfs_quota cfs_period < /sys/fs/cgroup/cpu.max
-    if [[ "$cfs_quota" != "max" && "$cfs_quota" =~ ^[0-9]+$ && "$cfs_period" =~ ^[0-9]+$ && "$cfs_period" -gt 0 ]]; then
-      cgroup_cpus=$(( (cfs_quota + cfs_period - 1) / cfs_period ))  # ceil
-    fi
-  fi
-  # cgroup v1 fallback
-  if [[ -z "${cgroup_cpus:-}" && -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
-    cfs_quota=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null || echo -1)
-    cfs_period=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null || echo 100000)
-    if [[ "$cfs_quota" -gt 0 && "$cfs_period" -gt 0 ]]; then
-      cgroup_cpus=$(( (cfs_quota + cfs_period - 1) / cfs_period ))  # ceil
-    fi
-  fi
-
-  local avail_cpus="${cgroup_cpus:-$host_cpus}"
-  (( avail_cpus < 1 )) && avail_cpus=1
-
-  # Disk heuristic: throttle a bit on spinning disks
-  local disk_is_rotational=0
-  # Try to detect the FS root backing device
-  local rootdev
-  rootdev=$(df --output=source / 2>/dev/null | awk 'NR==2{print $1}')
-  # Map to /sys/block/*/queue/rotational if possible
-  if [[ "$rootdev" =~ ^/dev/([a-zA-Z0-9]+) ]]; then
-    local blk="${BASH_REMATCH[1]}"
-    if [[ -r "/sys/block/$blk/queue/rotational" ]]; then
-      if [[ "$(cat /sys/block/$blk/queue/rotational 2>/dev/null)" == "1" ]]; then
-        disk_is_rotational=1
-      fi
-    fi
-  fi
-
-  # Current load: if the system is already hot, be conservative
-  local load1
-  load1=$(awk '{print int($1+0.5)}' /proc/loadavg 2>/dev/null || echo 0)
-
-  # Base: leave headroom for MySQL; target ~60–70% of CPUs
-  local base=$(( (avail_cpus * 2) / 3 ))
-  (( base < 1 )) && base=1
-
-  # If spinning disk, cap more aggressively (I/O bound)
-  local cap
-  if (( disk_is_rotational )); then
-    cap=$(( avail_cpus / 2 ))
-    (( cap < 1 )) && cap=1
-  else
-    # SSD/NVMe: allow more, but don't go wild
-    cap=$(( avail_cpus - 1 ))
-    (( cap < 1 )) && cap=1
-  fi
-
-  # If load already >= CPUs, halve our plan
-  if (( load1 >= avail_cpus )); then
-    base=$(( base / 2 ))
-    (( base < 1 )) && base=1
-  fi
-
-  # Final clamp and reasonable ceiling (avoid pathological values)
-  local jobs="$base"
-  (( jobs > cap )) && jobs="$cap"
-  (( jobs > 12 )) && jobs=12         # hard upper bound to be polite
-  (( jobs < 1 ))  && jobs=1
-
-  echo "$jobs"
-}
-
 
 generate_encryption_key() {
     local key_file="${1:-$ENCRYPTION_KEY_FILE}"
@@ -1317,29 +1232,27 @@ install_package() {
 # ========================== Compression Functions ==========================
 
 compressor() {
-    local cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
-    
     case "$COMPRESS_ALGO" in
         pigz)
             if have pigz; then
-                echo "pigz -p $cores -${COMPRESS_LEVEL} -c"
+                echo "pigz -p 1 -${COMPRESS_LEVEL} -c"
                 return
             fi
             ;;
         zstd)
             if have zstd; then
-                echo "zstd -${COMPRESS_LEVEL} -T0 -c"
+                echo "zstd -${COMPRESS_LEVEL} -c"
                 return
             fi
             ;;
         xz)
             if have xz; then
-                echo "xz -${COMPRESS_LEVEL} -T0 -c"
+                echo "xz -${COMPRESS_LEVEL} -c"
                 return
             fi
             ;;
     esac
-    
+
     echo "gzip -${COMPRESS_LEVEL} -c"
 }
 
@@ -2214,19 +2127,19 @@ backup_xtra_full() {
     read -r -a auth_args <<<"$(mysql_auth_args)"  # typically ["--defaults-file=/etc/db-tools.my.cnf"]
     local xtra_cmd=("$XTRABACKUP")
     xtra_cmd+=("${auth_args[@]}")                 # ← FIRST
-    xtra_cmd+=(--backup --target-dir="$backup_dir" --parallel="$XTRABACKUP_PARALLEL")
+    xtra_cmd+=(--backup --target-dir="$backup_dir")
 
     # Optional compression
     if [[ "$XTRABACKUP_COMPRESS" == "1" ]]; then
         case "$COMPRESS_ALGO" in
             zstd)
                 if have zstd; then
-                    xtra_cmd+=(--compress=zstd --compress-threads="$XTRABACKUP_COMPRESS_THREADS")
+                    xtra_cmd+=(--compress=zstd)
                 fi
                 ;;
             *)
                 if have qpress; then
-                    xtra_cmd+=(--compress --compress-threads="$XTRABACKUP_COMPRESS_THREADS")
+                    xtra_cmd+=(--compress)
                 fi
                 ;;
         esac
@@ -2245,7 +2158,6 @@ backup_xtra_full() {
             echo "server_version=$("$MYSQL" --login-path="$LOGIN_PATH" -N -e 'SELECT VERSION();')"
             echo "compression_algo=$COMPRESS_ALGO"
             echo "compression_level=$COMPRESS_LEVEL"
-            echo "parallel_jobs=$PARALLEL_JOBS"
             echo "backup_method=$BACKUP_METHOD"
             [[ "$ENCRYPT_BACKUPS" == "1" ]] && echo "encryption_cipher=aes-256-gcm"
             local gtid_mode
@@ -2332,19 +2244,19 @@ backup_xtra_incremental() {
     read -r -a auth_args <<<"$(mysql_auth_args)"
     local xtra_cmd=("$XTRABACKUP")
     xtra_cmd+=("${auth_args[@]}")   # --defaults-file first (and only once)
-    xtra_cmd+=(--backup --target-dir="$backup_dir" --incremental-basedir="$base_dir" --parallel="$XTRABACKUP_PARALLEL")
+    xtra_cmd+=(--backup --target-dir="$backup_dir" --incremental-basedir="$base_dir")
 
     # Optional compression
     if [[ "$XTRABACKUP_COMPRESS" == "1" ]]; then
         case "$COMPRESS_ALGO" in
             zstd)
                 if have zstd; then
-                    xtra_cmd+=(--compress=zstd --compress-threads="$XTRABACKUP_COMPRESS_THREADS")
+                    xtra_cmd+=(--compress=zstd)
                 fi
                 ;;
             *)
                 if have qpress; then
-                    xtra_cmd+=(--compress --compress-threads="$XTRABACKUP_COMPRESS_THREADS")
+                    xtra_cmd+=(--compress)
                 fi
                 ;;
         esac
@@ -2360,7 +2272,6 @@ backup_xtra_incremental() {
             echo "xtrabackup_version=$($XTRABACKUP --version 2>&1 | head -1)"
             echo "compression_algo=$COMPRESS_ALGO"
             echo "compression_level=$COMPRESS_LEVEL"
-            echo "parallel_jobs=$PARALLEL_JOBS"
             echo "backup_method=$BACKUP_METHOD"
             [[ "$ENCRYPT_BACKUPS" == "1" ]] && echo "encryption_cipher=aes-256-gcm"
             [[ -f "$backup_dir/xtrabackup_checkpoints" ]] && {
@@ -2436,7 +2347,6 @@ restore_xtra() {
         log INFO "Decompressing backup pages..."
         "$XTRABACKUP" --decompress \
             --target-dir="$backup_dir" \
-            --parallel="$XTRABACKUP_PARALLEL" \
             "${auth_args[@]}" || err "Decompression failed"
         # remove compressed chunks
         find "$backup_dir" \( -name "*.qp" -o -name "*.zst" \) -delete 2>/dev/null || true
@@ -2484,7 +2394,6 @@ restore_xtra() {
             if [[ -f "$incr_dir/xtrabackup_checkpoints" ]] && grep -q "compressed = 1" "$incr_dir/xtrabackup_checkpoints" 2>/dev/null; then
                 "$XTRABACKUP" --decompress \
                     --target-dir="$incr_dir" \
-                    --parallel="$XTRABACKUP_PARALLEL" \
                     "${auth_args[@]}" || err "Incremental decompression failed"
                 find "$incr_dir" \( -name "*.qp" -o -name "*.zst" \) -delete 2>/dev/null || true
             fi
@@ -2738,8 +2647,14 @@ OPTS
                     $decomp_cmd < "$out" 2>/dev/null | head -n 50
                 fi
             ) || true
-            if ! printf '%s' "$header" | grep -q "^-- MySQL dump"; then
-                warn "Backup validation failed: $db"
+            # Normalize control characters (except \n and \t) before matching header
+            local header_norm=""
+            header_norm="$(printf '%s' "$header" | tr -d '\r' | tr -d '\000-\010\013\014\016-\037')"
+            # Match anywhere in the first chunk to avoid BOM/whitespace edge cases
+            if [[ "$header_norm" != *"MySQL dump"* ]]; then
+                local header_first_line=""
+                header_first_line="$(printf '%s' "$header_norm" | head -n 1 | sed -E 's/[[:cntrl:]]+/ /g')"
+                warn "Backup validation failed: $db (header_len=${#header_norm}, first_line='${header_first_line}')"
                 return 1
             fi
             
@@ -2759,84 +2674,15 @@ OPTS
     mkdir -p "$status_dir"
     stack_trap "rm -rf '$status_dir'" EXIT
 
-    if (( PARALLEL_JOBS > 1 )); then
-        log INFO "Using $PARALLEL_JOBS parallel jobs"
-        start_spinner "Running backups"
-
-        # --- portable semaphore via FIFO (no wait -n needed) ---
-        local fifo
-        fifo="$(mktemp -u)"
-        mkfifo "$fifo"
-        # FD 3 will be our token stream
-        exec 3<>"$fifo"
-        rm -f "$fifo"   # fifo persists via FD
-
-        # seed tokens
-        for _ in $(seq 1 "$PARALLEL_JOBS"); do
-          printf '.' >&3
-        done
-
-        # ensure FD is closed at the end so the final read unblocks
-        stack_trap 'exec 3>&- 3<&- || true' EXIT
-
-        local job_num=0
-        for db in "${DBS[@]}"; do
-          # acquire a token (blocks if pool is empty)
-          read -r -u 3 _
-          ((job_num++)) || true
-
-          {
-            # run one dump
-            local status_file="$status_dir/job_${job_num}.status"
-            if dump_one "$db"; then
-              echo "ok" > "$status_file"
-            else
-              echo "error" > "$status_file"
-            fi
-          } &
-          
-          # watcher that waits for the job above and returns token
-          {
-            local pid=$!
-            wait "$pid" 2>/dev/null || true
-            # return the token
-            printf '.' >&3
-          } &
-        done
-
-        # Drain: take all tokens back so we know all jobs finished.
-        for _ in $(seq 1 "$PARALLEL_JOBS"); do
-            read -r -u 3 _
-        done
-
-        # close semaphore FD (also done by trap)
-        exec 3>&- 3<&- || true
-        stop_spinner
-        
-        # Count results from status files more reliably
-        completed=0
-        errors=0
-        for sf in "$status_dir"/job_*.status; do
-            [[ -f "$sf" ]] || continue
-            if grep -q "ok" "$sf" 2>/dev/null; then
-                ((completed++)) || true
-            else
-                ((errors++)) || true
-            fi
-        done
-
-        # Show final progress
+    # Always run sequentially to avoid job-control issues and reduce system impact.
+    for db in "${DBS[@]}"; do
+        if dump_one "$db"; then
+            ((completed++)) || true
+        else
+            ((errors++)) || true
+        fi
         show_progress "$completed" "${#DBS[@]}" "Backup"
-    else
-        for db in "${DBS[@]}"; do
-            if dump_one "$db"; then
-                ((completed++)) || true
-            else
-                ((errors++)) || true
-            fi
-            show_progress "$completed" "${#DBS[@]}" "Backup"
-        done
-    fi
+    done
 
     # Copy binlog index
     [[ -r /var/lib/mysql/binlog.index ]] && cp -f /var/lib/mysql/binlog.index "$BACKUP_DIR/binlog-index-$ts.txt" || true
@@ -3536,7 +3382,7 @@ health() {
     
     # Compression tool
     if have pigz || have zstd; then
-        echo "✅ Compression: Parallel compression available ($COMPRESS_ALGO)"
+        echo "✅ Compression: Available ($COMPRESS_ALGO)"
     else
         echo "⚠️  Compression: Using gzip (slower)"
     fi
@@ -3942,7 +3788,6 @@ generate_config() {
 # Backup settings
 BACKUP_DIR="/var/backups/mysql"
 RETENTION_DAYS=7
-PARALLEL_JOBS=2
 
 # Compression (zstd, pigz, gzip, xz)
 COMPRESS_ALGO="zstd"
@@ -3951,9 +3796,7 @@ COMPRESS_LEVEL=6
 # XtraBackup (physical backups - faster for InnoDB)
 BACKUP_METHOD="xtrabackup"  # xtrabackup or mysqldump
 XTRABACKUP_ENABLED=1
-XTRABACKUP_PARALLEL=4
 XTRABACKUP_COMPRESS=1
-XTRABACKUP_COMPRESS_THREADS=4
 XTRABACKUP_MEMORY="1G"  # Memory for prepare phase
 
 # GFS Rotation
@@ -4015,7 +3858,6 @@ Commands:
   sizes                         Show database and table sizes
   space                         Show backup space usage summary
   tune                          Run tuning advisors (mysqltuner, pt-variable-advisor)
-  tune-parallel                 Show auto-tuned parallel jobs count
   maintain [quick|full]         Run ANALYZE (quick) or OPTIMIZE (full)
   cleanup [days]                Remove old backups (default: RETENTION_DAYS)
 
@@ -4027,7 +3869,6 @@ Environment Variables:
   BACKUP_DIR                    Backup storage location (default: /var/backups/mysql)
   RETENTION_DAYS                Days to keep backups (default: 7)
   LOGIN_PATH                    MySQL login path (default: dbtools)
-  PARALLEL_JOBS                 Parallel backup jobs (default: 2)
   COMPRESS_ALGO                 zstd, pigz, gzip, xz (default: zstd)
   ENCRYPT_BACKUPS               0=off, 1=on (default: 0)
   CHECKSUM_ENABLED              0=off, 1=on (default: 1)
@@ -4135,16 +3976,6 @@ load_config
 # Check core dependencies early
 check_core_dependencies
 
-# Auto-tune PARALLEL_JOBS if not set or invalid
-if ! [[ "${PARALLEL_JOBS:-}" =~ ^[1-9][0-9]*$ ]]; then
-  PARALLEL_JOBS="$(auto_parallel_jobs)"
-  debug "Auto-tuned PARALLEL_JOBS=$PARALLEL_JOBS"
-fi
-# Keep XTRABACKUP_PARALLEL/XTRABACKUP_COMPRESS_THREADS in sync if they still use defaults
-: "${XTRABACKUP_PARALLEL:=$PARALLEL_JOBS}"
-: "${XTRABACKUP_COMPRESS_THREADS:=$PARALLEL_JOBS}"
-
-
 # Create directories
 mkdir -p "$BACKUP_DIR" "$MARK_DIR" 2>/dev/null || true
 
@@ -4184,9 +4015,6 @@ case "$cmd" in
         ;;
     tune)
         tune "$@"
-        ;;
-    tune-parallel)
-        echo "Auto-tuned PARALLEL_JOBS: $(auto_parallel_jobs)"
         ;;
     maintain)
         maintain "${1:-quick}"
