@@ -124,9 +124,12 @@ ensure_base_tools() {
 # Add PPA safely
 setup_ppa() {
     local ppa_name="ondrej/php"
-    local ppa_file="/etc/apt/sources.list.d/ondrej-ubuntu-php-$(lsb_release -cs).list"
-    
-    if [[ ! -f "$ppa_file" ]]; then
+    local codename
+    codename=$(lsb_release -cs)
+    local ppa_list="/etc/apt/sources.list.d/ondrej-ubuntu-php-${codename}.list"
+    local ppa_sources="/etc/apt/sources.list.d/ondrej-ubuntu-php-${codename}.sources"
+
+    if [[ ! -f "$ppa_list" && ! -f "$ppa_sources" ]]; then
         info "Adding PPA: $ppa_name"
         run_with_retry add-apt-repository -y ppa:$ppa_name
         SKIP_UPDATE=false # Force update if we just added PPA
@@ -391,11 +394,21 @@ verify_php_handler "$PHP_VERSION"
 update_alternatives() {
     local version="$1"
     info "Updating CLI alternatives..."
-    
+
     if [[ -f "/usr/bin/php${version}" ]]; then
+        # Register the alternative first if not already registered (--install is idempotent)
+        # Priority 100 is arbitrary; --set overrides priority-based selection anyway
+        update-alternatives --install /usr/bin/php php "/usr/bin/php${version}" 100
         update-alternatives --set php "/usr/bin/php${version}"
-        update-alternatives --set phar "/usr/bin/phar${version}" 2>/dev/null || true
-        update-alternatives --set phar.phar "/usr/bin/phar.phar${version}" 2>/dev/null || true
+
+        if [[ -f "/usr/bin/phar${version}" ]]; then
+            update-alternatives --install /usr/bin/phar phar "/usr/bin/phar${version}" 100
+            update-alternatives --set phar "/usr/bin/phar${version}"
+        fi
+        if [[ -f "/usr/bin/phar.phar${version}" ]]; then
+            update-alternatives --install /usr/bin/phar.phar phar.phar "/usr/bin/phar.phar${version}" 100
+            update-alternatives --set phar.phar "/usr/bin/phar.phar${version}"
+        fi
     else
         error "Binary /usr/bin/php${version} not found!"
     fi
