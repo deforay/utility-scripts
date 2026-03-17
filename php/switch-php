@@ -138,6 +138,27 @@ setup_ppa() {
     fi
 }
 
+# Fix any broken/half-configured packages before we start installing
+fix_broken_packages() {
+    if dpkg --audit 2>/dev/null | grep -q .; then
+        warn "Broken packages detected. Attempting to fix..."
+        # Stop any failed php-fpm services that block dpkg configure
+        for fpm_service in /lib/systemd/system/php*-fpm.service; do
+            [[ -f "$fpm_service" ]] || continue
+            local svc
+            svc=$(basename "$fpm_service")
+            if systemctl is-failed "$svc" >/dev/null 2>&1; then
+                warn "Resetting failed service: $svc"
+                systemctl reset-failed "$svc" 2>/dev/null || true
+                systemctl stop "$svc" 2>/dev/null || true
+            fi
+        done
+        dpkg --configure -a 2>/dev/null || true
+        apt-get install -f -y 2>/dev/null || true
+    fi
+}
+
+fix_broken_packages
 ensure_base_tools
 setup_ppa
 
