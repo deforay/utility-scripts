@@ -293,24 +293,15 @@ switch_apache_module() {
 
     info "Switching Apache to PHP $version..."
 
-    # Verify module files exist before attempting to enable
-    local mod_load="/etc/apache2/mods-available/php${version}.load"
-    local mod_conf="/etc/apache2/mods-available/php${version}.conf"
-
-    if [[ ! -f "$mod_load" ]]; then
-        warn "Apache PHP module file not found: $mod_load"
-        warn "Attempting to reinstall libapache2-mod-php${version}..."
-
-        # Force reinstall the Apache module
-        if ! run_with_retry apt-get install --reinstall -y "libapache2-mod-php${version}"; then
-            fatal "Failed to install Apache PHP module. Check if libapache2-mod-php${version} exists in repository."
+    # Enable mpm_prefork FIRST (required for mod_php)
+    # mod_php .load files won't be created if mpm_event/mpm_worker is active
+    if ! a2query -m mpm_prefork >/dev/null 2>&1; then
+        info "Enabling mpm_prefork (required for mod_php)..."
+        a2dismod -f mpm_event 2>/dev/null || true
+        a2dismod -f mpm_worker 2>/dev/null || true
+        if ! a2enmod mpm_prefork; then
+            fatal "Failed to enable mpm_prefork. mod_php requires the prefork MPM."
         fi
-
-        # Re-check after reinstall
-        if [[ ! -f "$mod_load" ]]; then
-            fatal "Apache PHP module file still missing after reinstall: $mod_load. Manual intervention required."
-        fi
-        info "Apache PHP module reinstalled successfully."
     fi
 
     # Disable all other PHP modules
@@ -325,14 +316,24 @@ switch_apache_module() {
         fi
     done
 
-    # Enable mpm_prefork if not active (required for mod_php)
-    if ! a2query -m mpm_prefork >/dev/null 2>&1; then
-        info "Enabling mpm_prefork (required for mod_php)..."
-        a2dismod -f mpm_event 2>/dev/null || true
-        a2dismod -f mpm_worker 2>/dev/null || true
-        if ! a2enmod mpm_prefork; then
-            fatal "Failed to enable mpm_prefork. mod_php requires the prefork MPM."
+    # Verify module files exist before attempting to enable
+    local mod_load="/etc/apache2/mods-available/php${version}.load"
+    local mod_conf="/etc/apache2/mods-available/php${version}.conf"
+
+    if [[ ! -f "$mod_load" ]]; then
+        warn "Apache PHP module file not found: $mod_load"
+        warn "Attempting to reinstall libapache2-mod-php${version}..."
+
+        # Force reinstall the Apache module (mpm_prefork is already active so .load will be created)
+        if ! run_with_retry apt-get install --reinstall -y "libapache2-mod-php${version}"; then
+            fatal "Failed to install Apache PHP module. Check if libapache2-mod-php${version} exists in repository."
         fi
+
+        # Re-check after reinstall
+        if [[ ! -f "$mod_load" ]]; then
+            fatal "Apache PHP module file still missing after reinstall: $mod_load. Manual intervention required."
+        fi
+        info "Apache PHP module reinstalled successfully."
     fi
 
     # Enable the target version
