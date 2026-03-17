@@ -44,6 +44,11 @@ warn() { log "WARN" "${YELLOW}${1}${NC}"; }
 error() { log "ERROR" "${RED}${1}${NC}"; }
 fatal() { log "FATAL" "${RED}${1}${NC}"; exit 1; }
 
+# Check if Apache is actually installed (not just leftover config dirs)
+is_apache_installed() {
+    command -v apache2 >/dev/null 2>&1 || command -v apachectl >/dev/null 2>&1
+}
+
 # Retry wrapper for network/lock sensitive commands
 run_with_retry() {
     local n=1
@@ -286,8 +291,8 @@ configure_php_tuning "$PHP_VERSION"
 switch_apache_module() {
     local version="$1"
 
-    if [[ ! -d /etc/apache2 ]]; then
-        warn "Apache2 not found, skipping module switch."
+    if ! is_apache_installed; then
+        warn "Apache2 not installed, skipping module switch."
         return
     fi
 
@@ -297,6 +302,11 @@ switch_apache_module() {
     # mod_php .load files won't be created if mpm_event/mpm_worker is active
     if ! a2query -m mpm_prefork >/dev/null 2>&1; then
         info "Enabling mpm_prefork (required for mod_php)..."
+        # Install mpm_prefork if the module file doesn't exist
+        if [[ ! -f /etc/apache2/mods-available/mpm_prefork.load ]]; then
+            info "mpm_prefork module not found, installing apache2 package..."
+            run_with_retry apt-get install -y apache2
+        fi
         a2dismod -f mpm_event 2>/dev/null || true
         a2dismod -f mpm_worker 2>/dev/null || true
         if ! a2enmod mpm_prefork; then
@@ -357,7 +367,7 @@ switch_apache_module "$PHP_VERSION"
 verify_php_handler() {
     local version="$1"
 
-    if [[ ! -d /etc/apache2 ]]; then
+    if ! is_apache_installed; then
         return
     fi
 
@@ -467,7 +477,7 @@ install_composer
 # --- Restart Services ---
 
 restart_apache_safe() {
-    if [[ ! -d /etc/apache2 ]]; then return; fi
+    if ! is_apache_installed; then return; fi
 
     info "Restarting Apache..."
     
@@ -493,7 +503,7 @@ restart_apache_safe
 # --- PHP Processing Verification ---
 
 verify_php_working() {
-    if [[ ! -d /etc/apache2 ]]; then
+    if ! is_apache_installed; then
         return 0
     fi
 
@@ -579,7 +589,7 @@ verify_php_working || warn "PHP HTTP verification failed; check web root/virtual
 info "--------------------------------------------------"
 info "PHP Switch Complete"
 info "Current CLI Version: $(php -r 'echo PHP_VERSION;')"
-if [[ -d /etc/apache2 ]]; then
+if is_apache_installed; then
     info "Apache Module: $(a2query -m | grep 'php' || echo 'None')"
 fi
 info "--------------------------------------------------"
