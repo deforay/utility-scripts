@@ -317,7 +317,7 @@ switch_apache_module() {
     # Disable all other PHP modules
     # We find them dynamically to be robust against any installed version
     local current_modules
-    current_modules=$(a2query -m 2>/dev/null | grep -oE 'php[0-9]+\.[0-9]+' || true)
+    current_modules=$(a2query -m 2>/dev/null | grep -oE 'php[0-9]+(\.[0-9]+)?' || true)
 
     for mod in $current_modules; do
         if [[ "$mod" != "php${version}" ]]; then
@@ -457,22 +457,14 @@ install_composer() {
     fi
 
     info "Installing/Updating Composer..."
-    EXPECTED_CHECKSUM="$(php -r 'copy("https://composer.github.io/installer.sig", "php://stdout");')"
-    php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
-    ACTUAL_CHECKSUM="$(php -r "echo hash_file('sha384', 'composer-setup.php');")"
-
-    if [[ "$EXPECTED_CHECKSUM" != "$ACTUAL_CHECKSUM" ]]; then
-        rm composer-setup.php
-        error "Composer installer corrupt"
+    if ! curl -fsSL https://getcomposer.org/composer-stable.phar -o /usr/local/bin/composer; then
+        error "Failed to download Composer."
         return 1
     fi
-
-    php composer-setup.php --quiet --install-dir=/usr/local/bin --filename=composer
-    rm composer-setup.php
     chmod +x /usr/local/bin/composer
 }
 
-install_composer
+install_composer || warn "Composer installation failed; install manually later if needed."
 
 # --- Restart Services ---
 
