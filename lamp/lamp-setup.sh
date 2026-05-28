@@ -428,7 +428,7 @@ install_mysql() {
         apt-get install -y mysql-server
 
         print info "Setting MySQL root password..."
-        mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${mysql_root_password}'; FLUSH PRIVILEGES;"
+        mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${mysql_root_password}'; FLUSH PRIVILEGES;"
 
         service mysql restart || {
             print error "Failed to restart MySQL. Exiting..."
@@ -444,7 +444,6 @@ configure_mysql() {
     desired_innodb_strict_mode="innodb_strict_mode = 0"
     desired_charset="character-set-server=utf8mb4"
     desired_collation="collation-server=utf8mb4_general_ci"
-    desired_auth_plugin="default_authentication_plugin=mysql_native_password"
     config_file="/etc/mysql/mysql.conf.d/mysqld.cnf"
 
     # Check if config already has all our desired settings
@@ -452,9 +451,9 @@ configure_mysql() {
     innodb_mode_exists=$(grep -c "^${desired_innodb_strict_mode}" ${config_file} || true)
     charset_exists=$(grep -c "^${desired_charset}" ${config_file} || true)
     collation_exists=$(grep -c "^${desired_collation}" ${config_file} || true)
-    auth_plugin_exists=$(grep -c "^${desired_auth_plugin}" ${config_file} || true)
+    legacy_auth_plugin=$(grep -c "^default_authentication_plugin" ${config_file} || true)
 
-    if [ $sql_mode_exists -gt 0 ] && [ $innodb_mode_exists -gt 0 ] && [ $charset_exists -gt 0 ] && [ $collation_exists -gt 0 ] && [ $auth_plugin_exists -gt 0 ]; then
+    if [ $sql_mode_exists -gt 0 ] && [ $innodb_mode_exists -gt 0 ] && [ $charset_exists -gt 0 ] && [ $collation_exists -gt 0 ] && [ $legacy_auth_plugin -eq 0 ]; then
         print info "MySQL already has all the required configurations. Skipping configuration."
     else
         print info "Some MySQL configurations need to be updated."
@@ -462,11 +461,10 @@ configure_mysql() {
 
         awk -v dsm="${desired_sql_mode}" -v dism="${desired_innodb_strict_mode}" \
             -v dcharset="${desired_charset}" -v dcollation="${desired_collation}" \
-            -v dauth="${desired_auth_plugin}" \
-            'BEGIN { sql_mode_added=0; innodb_strict_mode_added=0; charset_added=0; collation_added=0; auth_plugin_added=0; }
+            'BEGIN { sql_mode_added=0; innodb_strict_mode_added=0; charset_added=0; collation_added=0; }
                         /default_authentication_plugin[[:space:]]*=/ {
-                            if ($0 ~ dauth) {auth_plugin_added=1;}
-                            else {print ";" $0;}
+                            # Removed in MySQL 8.4; comment out any pre-existing entry.
+                            print ";" $0;
                             next;
                         }
                         /sql_mode[[:space:]]*=/ {
@@ -495,7 +493,6 @@ configure_mysql() {
                             if (innodb_strict_mode_added == 0) {print dism; innodb_strict_mode_added=1;}
                             if (charset_added == 0) {print dcharset; charset_added=1;}
                             if (collation_added == 0) {print dcollation; collation_added=1;}
-                            if (auth_plugin_added == 0) {print dauth; auth_plugin_added=1;}
                             next;
                         }
                         { print; }' ${config_file} >tmpfile && mv tmpfile ${config_file}
