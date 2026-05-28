@@ -72,11 +72,17 @@ rm -rf /var/cache/apt/archives/libapache2*
 # Remove apt preferences for Ondřej PPA
 rm -f /etc/apt/preferences.d/ondrej-php.pref
 
-# Remove Ondřej PPAs
+# Remove Ondřej PPAs (covers .list, deb822 .sources, and any .disabled markers)
 add-apt-repository --remove -y ppa:ondrej/php 2>/dev/null || true
 add-apt-repository --remove -y ppa:ondrej/apache2 2>/dev/null || true
 rm -f /etc/apt/sources.list.d/ondrej-ubuntu-php*.list
+rm -f /etc/apt/sources.list.d/ondrej-ubuntu-php*.list.disabled
+rm -f /etc/apt/sources.list.d/ondrej-ubuntu-php*.sources
+rm -f /etc/apt/sources.list.d/ondrej-ubuntu-php*.sources.disabled
 rm -f /etc/apt/sources.list.d/ondrej-ubuntu-apache2*.list
+rm -f /etc/apt/sources.list.d/ondrej-ubuntu-apache2*.list.disabled
+rm -f /etc/apt/sources.list.d/ondrej-ubuntu-apache2*.sources
+rm -f /etc/apt/sources.list.d/ondrej-ubuntu-apache2*.sources.disabled
 
 # Update apt cache after removing PPAs
 apt-get update

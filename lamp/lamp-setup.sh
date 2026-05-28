@@ -168,52 +168,52 @@ setup_system() {
         print info "All basic packages are already installed"
     fi
 
-    # Check and add PPA if needed
-    if ! grep -q "ondrej/apache2" /etc/apt/sources.list /etc/apt/sources.list.d/*; then
-        print info "Adding ondrej/apache2 PPA..."
-        add-apt-repository ppa:ondrej/apache2 -y
-        apt-get update
-    else
-        print info "ondrej/apache2 PPA already added"
-    fi
-
-    # If Ondrej hasn't published this Ubuntu codename yet, pin the PPA to the
-    # most recent codename it *does* publish (probed via Launchpad).
-    pin_ondrej_apache2_codename
-}
-
-pin_ondrej_apache2_codename() {
-    local ppa_name="ondrej/apache2"
+    # Add ondrej/apache2 only if Launchpad publishes the current codename.
+    # Cross-codename installs break due to ABI mismatches (libxml2 t64 etc.),
+    # so on unsupported Ubuntu releases we stick with the distro apache2.
+    local apache_ppa="ondrej/apache2"
     local codename
     codename=$(lsb_release -cs)
-    local ppa_list="/etc/apt/sources.list.d/ondrej-ubuntu-apache2-${codename}.list"
-    local ppa_sources="/etc/apt/sources.list.d/ondrej-ubuntu-apache2-${codename}.sources"
+    local apache_list="/etc/apt/sources.list.d/ondrej-ubuntu-apache2-${codename}.list"
+    local apache_sources="/etc/apt/sources.list.d/ondrej-ubuntu-apache2-${codename}.sources"
 
-    if curl -fsSLI -o /dev/null --max-time 10 \
-        "https://ppa.launchpadcontent.net/${ppa_name}/ubuntu/dists/${codename}/Release"; then
+    if [[ -f "${apache_list}.disabled" || -f "${apache_sources}.disabled" ]]; then
+        print info "${apache_ppa} previously disabled on '${codename}'; using distro apache2."
+    elif grep -q "ondrej/apache2" /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null; then
+        print info "${apache_ppa} PPA already added"
+        disable_apache2_ppa_if_unsupported "$codename" "$apache_list" "$apache_sources"
+    elif ! ppa_has_codename "$apache_ppa" "$codename"; then
+        print warning "${apache_ppa} has no build for '${codename}'; skipping PPA, using distro apache2."
+    else
+        print info "Adding ${apache_ppa} PPA..."
+        add-apt-repository ppa:ondrej/apache2 -y
+        apt-get update
+    fi
+}
+
+ppa_has_codename() {
+    local ppa_path="$1" cn="$2"
+    curl -fsSLI -o /dev/null --max-time 10 \
+        "https://ppa.launchpadcontent.net/${ppa_path}/ubuntu/dists/${cn}/Release" 2>/dev/null
+}
+
+# If ondrej/apache2 doesn't publish $codename, disable its source files so apt
+# falls back to the distro archive. Heals a previous noble-pin by restoring
+# the codename inside the file to match its filename suffix before disabling.
+disable_apache2_ppa_if_unsupported() {
+    local codename="$1" apache_list="$2" apache_sources="$3"
+
+    if ppa_has_codename "ondrej/apache2" "$codename"; then
+        [[ -f "$apache_sources" ]] && sed -i -E "s/^(Suites:[[:space:]]*).*/\1${codename}/" "$apache_sources" 2>/dev/null || true
+        [[ -f "$apache_list" ]]    && sed -i -E "s|(ubuntu[[:space:]]+)[a-zA-Z]+([[:space:]]+main)|\1${codename}\2|" "$apache_list" 2>/dev/null || true
         return 0
     fi
 
-    local fallback="" cn seen=","
-    for cn in resolute questing plucky oracular noble jammy; do
-        case "$seen" in *",$cn,"*) continue ;; esac
-        seen="${seen}${cn},"
-        [[ "$cn" == "$codename" ]] && continue
-        if curl -fsSLI -o /dev/null --max-time 10 \
-            "https://ppa.launchpadcontent.net/${ppa_name}/ubuntu/dists/${cn}/Release"; then
-            fallback="$cn"
-            break
-        fi
-    done
-
-    if [[ -z "$fallback" ]]; then
-        print warning "Could not find any published ondrej/apache2 codename; apt update may fail."
-        return 0
-    fi
-
-    print warning "ondrej/apache2 has no build for '${codename}'; pinning PPA to '${fallback}'."
-    [[ -f "$ppa_sources" ]] && sed -i -E "s/^(Suites:[[:space:]]*).*/\1${fallback}/" "$ppa_sources"
-    [[ -f "$ppa_list" ]]    && sed -i -E "s/(ubuntu[[:space:]]+)${codename}([[:space:]]+main)/\1${fallback}\2/" "$ppa_list"
+    print warning "ondrej/apache2 has no build for '${codename}'; disabling PPA, falling back to distro apache2."
+    [[ -f "$apache_sources" ]] && sed -i -E "s/^(Suites:[[:space:]]*).*/\1${codename}/" "$apache_sources" 2>/dev/null || true
+    [[ -f "$apache_list" ]]    && sed -i -E "s|(ubuntu[[:space:]]+)[a-zA-Z]+([[:space:]]+main)|\1${codename}\2|" "$apache_list" 2>/dev/null || true
+    [[ -f "$apache_sources" ]] && mv "$apache_sources" "${apache_sources}.disabled"
+    [[ -f "$apache_list" ]]    && mv "$apache_list" "${apache_list}.disabled"
     apt-get update || true
 }
 
