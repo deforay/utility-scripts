@@ -49,6 +49,31 @@ is_apache_installed() {
     command -v apache2 >/dev/null 2>&1 || command -v apachectl >/dev/null 2>&1
 }
 
+# Check whether apt currently knows about a package.
+# This lets us fail with a clear mod_php-specific message instead of a generic apt error.
+is_package_available() {
+    local package_name="$1"
+    apt-cache show "$package_name" >/dev/null 2>&1
+}
+
+get_ubuntu_release() {
+    if [[ -r /etc/os-release ]]; then
+        . /etc/os-release
+        echo "${VERSION_ID:-unknown}"
+    else
+        echo "unknown"
+    fi
+}
+
+fatal_mod_php_unavailable() {
+    local version="$1"
+    local package_name="libapache2-mod-php${version}"
+    local ubuntu_release
+    ubuntu_release=$(get_ubuntu_release)
+
+    fatal "Apache is installed and this script uses mod_php, but package ${package_name} is not available from apt on Ubuntu ${ubuntu_release}. PHP ${version} cannot be activated with mod_php on this host using the current repositories. Upgrade Ubuntu or provide a repository/build that includes ${package_name}."
+}
+
 # Retry wrapper for network/lock sensitive commands
 run_with_retry() {
     local n=1
@@ -126,6 +151,27 @@ ensure_base_tools() {
     fi
 }
 
+# Probe https://ppa.launchpadcontent.net/<ppa>/ubuntu/dists/<codename>/Release
+# and return the first published codename, starting from the current one and
+# walking back to known-supported releases. Echoes the codename on success.
+pick_ondrej_codename() {
+    local ppa_path="$1"
+    local current
+    current=$(lsb_release -cs)
+    local seen=","
+    local cn
+    for cn in "$current" resolute questing plucky oracular noble jammy; do
+        case "$seen" in *",$cn,"*) continue ;; esac
+        seen="${seen}${cn},"
+        if curl -fsSLI -o /dev/null --max-time 10 \
+            "https://ppa.launchpadcontent.net/${ppa_path}/ubuntu/dists/${cn}/Release"; then
+            printf '%s\n' "$cn"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Add PPA safely
 setup_ppa() {
     local ppa_name="ondrej/php"
@@ -140,6 +186,19 @@ setup_ppa() {
         SKIP_UPDATE=false # Force update if we just added PPA
     else
         info "PPA $ppa_name already present."
+    fi
+
+    # If Ondrej hasn't published this Ubuntu codename yet, pin the sources to
+    # the most recent codename that *is* published (typically the prior LTS).
+    if ! curl -fsSLI -o /dev/null --max-time 10 \
+        "https://ppa.launchpadcontent.net/${ppa_name}/ubuntu/dists/${codename}/Release"; then
+        local fallback
+        if fallback=$(pick_ondrej_codename "$ppa_name") && [[ "$fallback" != "$codename" ]]; then
+            warn "Ondrej PHP has no build for '${codename}'; pinning PPA to '${fallback}'."
+            [[ -f "$ppa_sources" ]] && sed -i -E "s/^(Suites:[[:space:]]*).*/\1${fallback}/" "$ppa_sources"
+            [[ -f "$ppa_list" ]]    && sed -i -E "s/(ubuntu[[:space:]]+)${codename}([[:space:]]+main)/\1${fallback}\2/" "$ppa_list"
+            SKIP_UPDATE=false
+        fi
     fi
 }
 
@@ -176,14 +235,23 @@ fi
 
 install_php_packages() {
     local version="$1"
+    local apache_module_package="libapache2-mod-php${version}"
     
     # Critical packages - must succeed
     local critical_packages=(
         "php${version}"
         "php${version}-cli"
         "php${version}-common"
-        "libapache2-mod-php${version}"
     )
+
+    if is_apache_installed; then
+        # Apache installations require the matching mod_php package; make the failure explicit
+        # before apt-get emits a generic "Unable to locate package" message.
+        if ! is_package_available "$apache_module_package"; then
+            fatal_mod_php_unavailable "$version"
+        fi
+        critical_packages+=("$apache_module_package")
+    fi
 
     # Standard Extensions - usually required
     local standard_extensions=(
@@ -332,11 +400,14 @@ switch_apache_module() {
 
     if [[ ! -f "$mod_load" ]]; then
         warn "Apache PHP module file not found: $mod_load"
+        if ! is_package_available "libapache2-mod-php${version}"; then
+            fatal_mod_php_unavailable "$version"
+        fi
         warn "Attempting to reinstall libapache2-mod-php${version}..."
 
         # Force reinstall the Apache module (mpm_prefork is already active so .load will be created)
         if ! run_with_retry apt-get install --reinstall -y "libapache2-mod-php${version}"; then
-            fatal "Failed to install Apache PHP module. Check if libapache2-mod-php${version} exists in repository."
+            fatal "Failed to install Apache PHP module libapache2-mod-php${version} even though apt reports it as available. Check apt policy, package pinning, and repository health."
         fi
 
         # Re-check after reinstall

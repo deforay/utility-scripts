@@ -176,6 +176,45 @@ setup_system() {
     else
         print info "ondrej/apache2 PPA already added"
     fi
+
+    # If Ondrej hasn't published this Ubuntu codename yet, pin the PPA to the
+    # most recent codename it *does* publish (probed via Launchpad).
+    pin_ondrej_apache2_codename
+}
+
+pin_ondrej_apache2_codename() {
+    local ppa_name="ondrej/apache2"
+    local codename
+    codename=$(lsb_release -cs)
+    local ppa_list="/etc/apt/sources.list.d/ondrej-ubuntu-apache2-${codename}.list"
+    local ppa_sources="/etc/apt/sources.list.d/ondrej-ubuntu-apache2-${codename}.sources"
+
+    if curl -fsSLI -o /dev/null --max-time 10 \
+        "https://ppa.launchpadcontent.net/${ppa_name}/ubuntu/dists/${codename}/Release"; then
+        return 0
+    fi
+
+    local fallback="" cn seen=","
+    for cn in resolute questing plucky oracular noble jammy; do
+        case "$seen" in *",$cn,"*) continue ;; esac
+        seen="${seen}${cn},"
+        [[ "$cn" == "$codename" ]] && continue
+        if curl -fsSLI -o /dev/null --max-time 10 \
+            "https://ppa.launchpadcontent.net/${ppa_name}/ubuntu/dists/${cn}/Release"; then
+            fallback="$cn"
+            break
+        fi
+    done
+
+    if [[ -z "$fallback" ]]; then
+        print warning "Could not find any published ondrej/apache2 codename; apt update may fail."
+        return 0
+    fi
+
+    print warning "ondrej/apache2 has no build for '${codename}'; pinning PPA to '${fallback}'."
+    [[ -f "$ppa_sources" ]] && sed -i -E "s/^(Suites:[[:space:]]*).*/\1${fallback}/" "$ppa_sources"
+    [[ -f "$ppa_list" ]]    && sed -i -E "s/(ubuntu[[:space:]]+)${codename}([[:space:]]+main)/\1${fallback}\2/" "$ppa_list"
+    apt-get update || true
 }
 
 setup_locale() {
