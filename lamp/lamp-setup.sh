@@ -486,19 +486,86 @@ EOF
     done
 }
 
+# Wait until the local mysqld accepts connections (socket, as OS root).
+wait_for_mysql() {
+    local i
+    for i in $(seq 1 30); do
+        if mysqladmin ping &>/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# Idempotently switch root@localhost to password authentication and VERIFY it
+# over TCP — the way the application connects.
+#
+# Fresh MySQL 8 ships root on the auth_socket plugin, which authenticates by the
+# OS peer user over the unix socket. That makes every check run here as OS root
+# (mysqladmin ping, mysql -u root) succeed even though the app — connecting with
+# a password as www-data — gets "Access denied for user 'root'@'localhost'". So
+# we run the ALTER as OS root via the socket (works whether root is still
+# auth_socket or already password-auth via ~/.my.cnf), pin it to
+# mysql_native_password (what PHP/LIS uses), and then confirm with a real TCP
+# password login, which auth_socket cannot satisfy.
+enforce_mysql_root_password() {
+    print info "Ensuring MySQL root uses password authentication..."
+    if ! wait_for_mysql; then
+        print error "MySQL is not accepting connections; cannot configure root auth. Exiting..."
+        exit 1
+    fi
+
+    # Pick the auth plugin by server flavor:
+    #   - MySQL 8.x: caching_sha2_password — the modern default and future-proof
+    #     (mysql_native_password is deprecated and disabled by default on 8.4+).
+    #     PHP 7.4+/mysqlnd speaks it over both socket and TCP.
+    #   - MariaDB: has no caching_sha2_password, so use mysql_native_password.
+    # Within MySQL we fall back to native_password if caching_sha2 can't be set.
+    # (Longer term the app should use a dedicated non-root user and leave root on
+    # auth_socket for local admin.)
+    local plugins="caching_sha2_password mysql_native_password"
+    if mysql --version 2>/dev/null | grep -qi mariadb; then
+        plugins="mysql_native_password"
+    fi
+
+    # Verify as a NON-root OS user over the socket — exactly how the app (www-data)
+    # connects. The socket is a secure transport, so caching_sha2 needs no
+    # public-key exchange, native_password works too, and auth_socket correctly
+    # FAILS this check (it would only pass for OS user root). This is what every
+    # OS-root/socket check in this script missed.
+    local verify_user="nobody"
+    local run_as_verify="runuser -u ${verify_user} --"
+    command -v runuser >/dev/null 2>&1 || run_as_verify="sudo -u ${verify_user}"
+
+    local plugin attempt
+    for plugin in $plugins; do
+        for attempt in 1 2 3; do
+            if mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH ${plugin} BY '${mysql_root_password}'; FLUSH PRIVILEGES;" &>/dev/null \
+                && $run_as_verify mysql -u root -p"${mysql_root_password}" -e "SELECT 1;" &>/dev/null; then
+                print success "MySQL root password authentication verified (${plugin}, non-root over socket)."
+                return 0
+            fi
+            sleep 2
+        done
+        print warning "Could not set root via ${plugin}; trying the next option..."
+    done
+
+    print error "Could not configure MySQL root for password authentication."
+    print error "The application connects with a password and will fail until this is resolved."
+    exit 1
+}
+
 install_mysql() {
     if ! command -v mysql &>/dev/null; then
         print header "Installing MySQL..."
         apt-get install -y mysql-server
-
-        print info "Setting MySQL root password..."
-        mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${mysql_root_password}'; FLUSH PRIVILEGES;"
-
-        service mysql restart || {
-            print error "Failed to restart MySQL. Exiting..."
-            exit 1
-        }
+        service mysql start &>/dev/null || systemctl start mysql &>/dev/null || true
     fi
+
+    # Always (re-)assert password auth, even when MySQL was already installed, so
+    # a prior run that left root on auth_socket self-heals on the next run.
+    enforce_mysql_root_password
 }
 
 configure_mysql() {
