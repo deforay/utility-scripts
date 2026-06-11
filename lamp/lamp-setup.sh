@@ -406,6 +406,31 @@ get_mysql_password() {
     mysql_root_password=""
     mysql_root_password_confirm=""
 
+    # Accept a password supplied by the caller (e.g. intelis setup.sh, which has
+    # already collected it) via the MYSQL_ROOT_PASSWORD env var, so we don't
+    # prompt a second time. If MySQL is already running and the supplied password
+    # fails to authenticate, fall through to the normal prompt rather than
+    # trusting it blindly; pre-install (no mysqld yet) we accept it and the
+    # install step sets root to this value.
+    if [ -n "${MYSQL_ROOT_PASSWORD:-}" ]; then
+        mysql_root_password="${MYSQL_ROOT_PASSWORD}"
+        if command -v mysqladmin &>/dev/null && ! mysqladmin ping -u root -p"${mysql_root_password}" &>/dev/null; then
+            print warning "Caller-supplied MySQL password did not verify against the running server; prompting."
+            mysql_root_password=""
+        else
+            print info "Using MySQL root password supplied by the caller."
+            print info "Storing MySQL root password securely..."
+            cat <<EOF >~/.my.cnf
+[client]
+user=root
+password=${mysql_root_password}
+host=localhost
+EOF
+            chmod 600 ~/.my.cnf
+            return
+        fi
+    fi
+
     # Reuse existing password from ~/.my.cnf when valid
     if [ -f ~/.my.cnf ]; then
         mysql_root_password=$(awk -F= '/^password[[:space:]]*=/{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' ~/.my.cnf)
