@@ -372,6 +372,135 @@ install_php_packages() {
 
 install_php_packages "$PHP_VERSION"
 
+# --- Ensure phar is usable (Composer depends on it) ---
+
+# phar is compiled into php-cli, but hardening profiles (CIS, custom conf.d)
+# sometimes blacklist it via disable_classes/disable_functions. When they do,
+# Composer aborts with "PHP's phar extension is missing" and every downstream
+# installer (LIS setup/upgrade) dies. Since switch-php owns PHP for all of
+# them, heal it here so `switch-php <ver>` alone is a sufficient fix.
+ensure_phar_extension() {
+    local version="$1"
+    local php_bin="/usr/bin/php${version}"
+    local cli_dir="/etc/php/${version}/cli"
+
+    [[ -x "$php_bin" ]] || return 0
+
+    # Already loaded? Nothing to do.
+    if "$php_bin" -r 'exit(extension_loaded("phar") ? 0 : 1);' >/dev/null 2>&1; then
+        info "phar extension active in PHP ${version} CLI."
+        return 0
+    fi
+
+    warn "phar not active in PHP ${version} CLI; checking for a blacklist..."
+
+    # The CLI SAPI reads php.ini plus everything symlinked into conf.d/.
+    shopt -s nullglob
+    local files=("${cli_dir}/php.ini" "${cli_dir}/conf.d/"*.ini)
+    shopt -u nullglob
+
+    local ts file target
+    ts=$(date '+%Y%m%d%H%M%S')
+    # grep over explicitly listed files reads through symlinks; guard the
+    # no-match exit so set -e doesn't abort us.
+    while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        target=$(readlink -f "$file" 2>/dev/null || echo "$file")
+        cp "$target" "${target}.bak.${ts}" 2>/dev/null || true
+        sed -i -E '/^[[:space:]]*disable_(classes|functions)[[:space:]]*=.*[Pp]har/ s/^/;/' "$target"
+        info "Neutralised phar blacklist in: ${target} (backup: ${target}.bak.${ts})"
+    done < <(grep -lE 'disable_(classes|functions)[[:space:]]*=.*[Pp]har' "${files[@]}" 2>/dev/null || true)
+
+    if "$php_bin" -r 'exit(extension_loaded("phar") ? 0 : 1);' >/dev/null 2>&1; then
+        info "phar extension is now active."
+        return 0
+    fi
+
+    # Not a blacklist — the build itself is missing phar. It lives in php-cli/
+    # php-common, so a reinstall restores it.
+    warn "phar still missing after blacklist check; reinstalling php${version}-cli/common..."
+    run_with_retry apt-get install --reinstall -y "php${version}-cli" "php${version}-common" || true
+
+    if "$php_bin" -r 'exit(extension_loaded("phar") ? 0 : 1);' >/dev/null 2>&1; then
+        info "phar extension is now active."
+        return 0
+    fi
+
+    # phar is the one extension Composer cannot run without — fail loudly rather
+    # than let every downstream installer die with a cryptic Composer error.
+    error "phar extension could NOT be enabled for PHP ${version}."
+    error "Composer (and LIS setup/upgrade) cannot run without it."
+    error "Inspect manually: ${php_bin} --ini  and  ${php_bin} -i | grep -Ei 'disable_(functions|classes)|suhosin'"
+    fatal "Unable to provide a working phar extension. Aborting."
+}
+
+ensure_phar_extension "$PHP_VERSION"
+
+# --- Verify & install any missing extensions ---
+
+# After install_php_packages, confirm each extension is actually *loaded* in the
+# CLI (a package can be installed but its module disabled/blacklisted). For any
+# that's missing, (re)install the owning package and re-check. Non-fatal: warn
+# and move on so a single odd extension doesn't block the whole switch. phar is
+# handled separately above because it's mandatory.
+verify_and_install_extensions() {
+    local version="$1"
+    local php_bin="/usr/bin/php${version}"
+
+    [[ -x "$php_bin" ]] || return 0
+
+    # ext-name : apt package suffix (php${version}-<suffix>)
+    local pairs=(
+        "curl:curl"
+        "gd:gd"
+        "mbstring:mbstring"
+        "xml:xml"
+        "zip:zip"
+        "mysqli:mysql"
+        "pdo_mysql:mysql"
+        "bcmath:bcmath"
+        "intl:intl"
+        "gmp:gmp"
+        "Zend OPcache:opcache"
+        "sqlite3:sqlite3"
+        "imagick:imagick"
+    )
+
+    info "Verifying required PHP extensions are loaded..."
+
+    local entry ext pkg still_missing=()
+    for entry in "${pairs[@]}"; do
+        ext="${entry%%:*}"
+        pkg="${entry##*:}"
+        if "$php_bin" -r "exit(extension_loaded('${ext}') ? 0 : 1);" >/dev/null 2>&1; then
+            continue
+        fi
+        warn "Extension '${ext}' not loaded; installing php${version}-${pkg}..."
+        # Skip packages apt doesn't know about (e.g. imagick on some releases).
+        if ! apt-cache show "php${version}-${pkg}" >/dev/null 2>&1; then
+            warn "Package php${version}-${pkg} not available in apt; skipping '${ext}'."
+            continue
+        fi
+        run_with_retry apt-get install -y "php${version}-${pkg}" || \
+            run_with_retry apt-get install --reinstall -y "php${version}-${pkg}" || true
+        phpenmod -v "$version" "$pkg" 2>/dev/null || true
+        if ! "$php_bin" -r "exit(extension_loaded('${ext}') ? 0 : 1);" >/dev/null 2>&1; then
+            still_missing+=("${ext}")
+        else
+            info "Extension '${ext}' is now loaded."
+        fi
+    done
+
+    if [[ ${#still_missing[@]} -gt 0 ]]; then
+        warn "Still missing after install attempts: ${still_missing[*]}"
+        warn "These may be unavailable for PHP ${version} on this Ubuntu release, or blacklisted."
+    else
+        info "All required PHP extensions are loaded."
+    fi
+}
+
+verify_and_install_extensions "$PHP_VERSION"
+
 # --- Configuration (The Idempotent Way) ---
 
 configure_php_tuning() {
