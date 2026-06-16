@@ -6,6 +6,7 @@
 # Usage:
 # sudo switch-php 8.2
 # sudo switch-php 8.3 --force
+# sudo switch-php 8.4 --fpm     # also install php-fpm (opt-in; never pulled in implicitly)
 #
 # Robust PHP Switcher for Ubuntu
 # Idempotent, Resilient, and Safe
@@ -109,6 +110,7 @@ flock -n 200 || fatal "Another instance is already running."
 
 if [[ $# -lt 1 ]]; then
     echo "Usage: $0 <php-version> [options]"
+    echo "Options: --force | --no-update | --fast | --fpm"
     echo "Example: $0 8.2 --force"
     exit 1
 fi
@@ -119,15 +121,17 @@ shift
 FORCE_MODE=false
 SKIP_UPDATE=false
 FAST_MODE=false
+WANT_FPM=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -f|--force) FORCE_MODE=true ;;
         --no-update) SKIP_UPDATE=true ;;
-        --fast) 
+        --fast)
             FAST_MODE=true
             SKIP_UPDATE=true
             ;;
+        --fpm) WANT_FPM=true ;;
         *) warn "Unknown option: $1" ;;
     esac
     shift
@@ -286,9 +290,14 @@ install_php_packages() {
     local version="$1"
     local apache_module_package="libapache2-mod-php${version}"
     
-    # Critical packages - must succeed
+    # Critical packages - must succeed.
+    # NOTE: we deliberately do NOT install the "php${version}" metapackage. It
+    # Depends on "libapache2-mod-php | php-cgi | php-fpm | php-litespeed", and
+    # apt may satisfy that "or" by pulling in php-fpm — an unrequested SAPI that
+    # then fails to configure on mod_php hosts and jams the whole apt run. We
+    # install exactly what's needed: cli + common here, mod_php below when
+    # Apache is present, the extension set later, and FPM only via --fpm.
     local critical_packages=(
-        "php${version}"
         "php${version}-cli"
         "php${version}-common"
     )
@@ -312,6 +321,16 @@ install_php_packages() {
             fatal_mod_php_unavailable "$version"
         fi
         critical_packages+=("$apache_module_package")
+    fi
+
+    # FPM is opt-in only (--fpm). It is never pulled in implicitly.
+    if [[ "$WANT_FPM" == "true" ]]; then
+        if is_package_available "php${version}-fpm"; then
+            info "Including php${version}-fpm (requested via --fpm)."
+            critical_packages+=("php${version}-fpm")
+        else
+            warn "php${version}-fpm requested but not available in apt; skipping."
+        fi
     fi
 
     # Standard Extensions - usually required
