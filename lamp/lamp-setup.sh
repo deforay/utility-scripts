@@ -123,6 +123,28 @@ is_valid_ubuntu() {
     return 0
 }
 
+# Pick the default PHP major.minor for the running OS when the caller didn't
+# pass a version. Ubuntu <=24.04 carries (and ondrej's PPA still builds) PHP
+# 8.4; Ubuntu 26.04 dropped 8.4 and ships 8.5, so default to 8.5 there. Any
+# explicit version passed on the command line always wins over this.
+default_php_version_for_os() {
+    local ubuntu_version
+    ubuntu_version=$(lsb_release -rs 2>/dev/null || echo "")
+
+    # Can't detect the release -> stick with the long-standing baseline.
+    if [[ -z "$ubuntu_version" ]]; then
+        echo "8.4"
+        return
+    fi
+
+    # 26.04 and newer no longer provide PHP 8.4; use 8.5.
+    if [[ "$(printf '%s\n' "26.04" "$ubuntu_version" | sort -V | head -n1)" == "26.04" ]]; then
+        echo "8.5"
+    else
+        echo "8.4"
+    fi
+}
+
 check_dependencies() {
     for cmd in "apt-get"; do
         if ! command -v $cmd &>/dev/null; then
@@ -668,7 +690,7 @@ EOF
 #=============================================================================
 
 install_php() {
-    local php_version=${1:-8.4}
+    local php_version=${1:-$(default_php_version_for_os)}
     local force_flag=${2:-}
     print header "Installing and configuring PHP $php_version..."
 
@@ -787,7 +809,7 @@ main() {
     trap 'error_handling "${BASH_COMMAND}" "$LINENO" "$?"' ERR
 
     # Parse arguments
-    local PHP_VERSION=${1:-8.4}
+    local PHP_VERSION=${1:-$(default_php_version_for_os)}
     local FORCE_FLAG=""
 
     # Check for force flag in any position
@@ -799,9 +821,9 @@ main() {
         fi
     done
 
-    # If force flag is present and first arg is the flag, use default PHP version
+    # If force flag is present and first arg is the flag, use the OS default.
     if [ "$1" = "-f" ] || [ "$1" = "--force" ]; then
-        PHP_VERSION="8.4"
+        PHP_VERSION="$(default_php_version_for_os)"
     fi
 
     print header "Starting LAMP Setup Script"
