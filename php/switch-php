@@ -391,6 +391,66 @@ install_php_packages() {
 
 install_php_packages "$PHP_VERSION"
 
+# --- Re-enable a PHP module whose switch-on was lost ---
+
+# Debian/ondrej PHP ships most extensions (phar included) as shared modules
+# switched on by conf.d links to mods-available/<module>.ini. Those .ini files
+# are not dpkg conffiles: postinst creates them through ucf, which remembers a
+# deletion and refuses to recreate the file ("Not replacing deleted config
+# file"), so no reinstall brings them back. And phpenmod remembers modules an
+# admin disabled. So: restore the .ini from the package's own template under
+# /usr/share/php<ver>-*/, then enable the module for every SAPI (which also
+# clears the admin-disabled state).
+heal_php_module() {
+    local version="$1" module="$2" pkg="$3"
+    local ini="/etc/php/${version}/mods-available/${module}.ini"
+    local template so_dir
+    if [[ ! -f "$ini" ]]; then
+        template=$(find /usr/share/php${version}-* -name "${module}.ini" -type f 2>/dev/null | head -n 1 || true)
+        if [[ -z "$template" ]]; then
+            # The template ships with the package; install it if absent.
+            run_with_retry apt-get install -y "$pkg" || true
+            template=$(find /usr/share/php${version}-* -name "${module}.ini" -type f 2>/dev/null | head -n 1 || true)
+        fi
+        so_dir=$("/usr/bin/php${version}" -n -r 'echo ini_get("extension_dir");' 2>/dev/null || true)
+        if [[ -n "$template" ]]; then
+            warn "Restoring missing ${ini} from ${template}"
+            mkdir -p "$(dirname "$ini")"
+            cp "$template" "$ini"
+        elif [[ -n "$so_dir" && -f "${so_dir}/${module}.so" ]]; then
+            warn "Recreating missing ${ini}"
+            mkdir -p "$(dirname "$ini")"
+            printf '; configuration for php %s module\n; priority=20\nextension=%s.so\n' "$module" "$module" >"$ini"
+        fi
+    fi
+    if [[ -f "$ini" ]]; then
+        phpenmod -v "$version" -s ALL "$module" 2>/dev/null || true
+    fi
+}
+
+# Sweep: every module whose package is installed (its template exists) but
+# whose mods-available/<module>.ini is gone gets it back and is enabled. Covers
+# the "whole /etc/php/<ver> wiped" case in one pass instead of per extension.
+heal_all_php_modules() {
+    local version="$1" template module healed=0
+    shopt -s nullglob
+    for template in /usr/share/php${version}-*/*/*.ini; do
+        module=$(basename "$template" .ini)
+        [[ -f "/etc/php/${version}/mods-available/${module}.ini" ]] && continue
+        mkdir -p "/etc/php/${version}/mods-available"
+        cp "$template" "/etc/php/${version}/mods-available/${module}.ini"
+        phpenmod -v "$version" -s ALL "$module" 2>/dev/null || true
+        healed=$((healed + 1))
+        warn "Restored missing PHP ${version} module config: ${module}"
+    done
+    shopt -u nullglob
+    if ((healed > 0)); then
+        info "Restored ${healed} missing PHP ${version} module config file(s)."
+    fi
+}
+
+heal_all_php_modules "$PHP_VERSION"
+
 # --- Ensure phar is usable (Composer depends on it) ---
 
 # phar is compiled into php-cli, but hardening profiles (CIS, custom conf.d)
@@ -435,10 +495,19 @@ ensure_phar_extension() {
         return 0
     fi
 
-    # Not a blacklist — the build itself is missing phar. It lives in php-cli/
-    # php-common, so a reinstall restores it.
-    warn "phar still missing after blacklist check; reinstalling php${version}-cli/common..."
-    run_with_retry apt-get install --reinstall -y "php${version}-cli" "php${version}-common" || true
+    # Not a blacklist: phar is a shared module in php-common, so its switch-on
+    # (conf.d link or mods-available/phar.ini) is gone, or the files themselves.
+    warn "phar still missing after blacklist check; re-enabling the module..."
+    heal_php_module "$version" phar "php${version}-common"
+    if "$php_bin" -r 'exit(extension_loaded("phar") ? 0 : 1);' >/dev/null 2>&1; then
+        info "phar extension is now active."
+        return 0
+    fi
+
+    warn "phar still missing; reinstalling php${version}-cli/common..."
+    run_with_retry apt-get install --reinstall -y -o Dpkg::Options::="--force-confmiss" \
+        "php${version}-cli" "php${version}-common" || true
+    phpenmod -v "$version" -s ALL phar 2>/dev/null || true
 
     if "$php_bin" -r 'exit(extension_loaded("phar") ? 0 : 1);' >/dev/null 2>&1; then
         info "phar extension is now active."
@@ -449,7 +518,11 @@ ensure_phar_extension() {
     # than let every downstream installer die with a cryptic Composer error.
     error "phar extension could NOT be enabled for PHP ${version}."
     error "Composer (and LIS setup/upgrade) cannot run without it."
+    error "PHP's own startup errors, if any:"
+    "$php_bin" -r 'echo "php runs\n";' 2>&1 | head -n 5 || true
     error "Inspect manually: ${php_bin} --ini  and  ${php_bin} -i | grep -Ei 'disable_(functions|classes)|suhosin'"
+    error "If PHP ${version} was removed or /etc/php deleted before, reinstall it cleanly:"
+    error "  sudo apt-get purge -y 'php${version}*' && sudo rm -rf /etc/php/${version} && sudo switch-php ${version}"
     fatal "Unable to provide a working phar extension. Aborting."
 }
 
@@ -502,7 +575,11 @@ verify_and_install_extensions() {
         fi
         run_with_retry apt-get install -y "php${version}-${pkg}" || \
             run_with_retry apt-get install --reinstall -y "php${version}-${pkg}" || true
-        phpenmod -v "$version" "$pkg" 2>/dev/null || true
+        # phpenmod wants the module name (mysqli, pdo_mysql, opcache), not the
+        # package suffix (mysql).
+        local module="${ext,,}"
+        module="${module#zend }"
+        heal_php_module "$version" "$module" "php${version}-${pkg}"
         if ! "$php_bin" -r "exit(extension_loaded('${ext}') ? 0 : 1);" >/dev/null 2>&1; then
             still_missing+=("${ext}")
         else
