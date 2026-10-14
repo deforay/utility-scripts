@@ -280,26 +280,125 @@ setup_ssh() {
 # APACHE SETUP FUNCTIONS
 #=============================================================================
 
+# True when at least one package matching the dpkg pattern is unpacked and
+# configured. Reads the state field alone so held packages ("hold ok installed")
+# still count, and half-installed/removed ("rc") ones do not.
+pkg_installed() {
+    dpkg-query -W -f='${db:Status-Eflag} ${db:Status-Status}\n' "$1" 2>/dev/null | grep -qx "ok installed"
+}
+
+# Installed package names matching the dpkg pattern, one per line.
+installed_pkgs() {
+    dpkg-query -W -f='${db:Status-Status} ${Package}\n' "$@" 2>/dev/null | awk '$1 == "installed" {print $2}'
+}
+
+# True when the apache2 package is installed AND its config tree is intact.
+# `command -v apache2` is not enough: the binary ships in apache2-bin, so after
+# `apt remove/purge apache2` (or a deleted /etc/apache2) the binary is still
+# there while apache2.conf, a2enmod's mods-available/ and the unit are gone.
+apache_config_intact() {
+    pkg_installed apache2 &&
+        [[ -f /etc/apache2/apache2.conf ]] &&
+        [[ -f /etc/apache2/envvars ]] &&
+        apache_required_modules_present
+}
+
+# mpm_prefork first: until an MPM is loaded every apache2ctl call errors.
+APACHE_REQUIRED_MODULES=(mpm_prefork rewrite headers deflate env)
+
+apache_required_modules_present() {
+    local module
+    for module in "${APACHE_REQUIRED_MODULES[@]}"; do
+        [[ -f "/etc/apache2/mods-available/${module}.load" ]] || return 1
+    done
+}
+
+# Explain why Apache will not start, in terms an operator can act on, then exit.
+apache_start_failed() {
+    print error "Apache could not be started."
+    log_action "Apache could not be started."
+
+    if ! apache2ctl configtest >/dev/null 2>&1; then
+        print error "Apache configuration test failed:"
+        apache2ctl configtest 2>&1 | tail -n 10
+    fi
+
+    local port_owner
+    port_owner=$(ss -ltnp 2>/dev/null | awk '$4 ~ /:(80|443)$/ && $0 !~ /apache2/ {print $4, $6}' | head -n 3)
+    if [[ -n "$port_owner" ]]; then
+        print error "Port 80/443 is already used by another program:"
+        echo "$port_owner"
+        print info "Stop or remove that program (for example: systemctl disable --now nginx), then run setup again."
+    fi
+
+    print info "Last Apache log lines:"
+    journalctl -u apache2 --no-pager -n 15 2>/dev/null || true
+    print info "If Apache was removed or its /etc/apache2 folder deleted, repair it with:"
+    print info "  sudo apt-get purge -y apache2 apache2-bin apache2-data apache2-utils && sudo apt-get install -y apache2"
+    print info "then run setup again."
+    exit 1
+}
+
 install_apache() {
     print header "Setting up Apache..."
 
-    if command -v apache2 &>/dev/null; then
+    if apache_config_intact; then
         print info "Apache is already installed. Checking configuration..."
+    elif command -v apache2 &>/dev/null || [[ -d /etc/apache2 ]]; then
+        # Binary present but package/config missing: restore the deleted
+        # conffiles instead of trusting the half-installed state.
+        print warning "Apache is partly installed (configuration files missing). Repairing..."
+        log_action "Apache partly installed; reinstalling with --force-confmiss"
+        apt-get install -y --reinstall -o Dpkg::Options::="--force-confmiss" \
+            apache2 apache2-bin apache2-data apache2-utils || true
     else
         print info "Installing Apache..."
         apt-get install -y apache2
     fi
 
+    if ! apache_config_intact; then
+        print error "Apache is installed but its configuration files are missing, and automatic repair did not restore them."
+        print info "Repair it with:"
+        print info "  sudo apt-get purge -y apache2 apache2-bin apache2-data apache2-utils && sudo apt-get install -y apache2"
+        print info "then run setup again."
+        log_action "Apache config still missing after repair attempt"
+        exit 1
+    fi
+
+    # Leftovers from removed packages stop Apache from starting: links in
+    # *-enabled/ whose target is gone, and enabled modules whose .so was removed
+    # (typically libphpX.Y.so after that PHP version was uninstalled).
+    local link mod_load so
+    for link in /etc/apache2/{mods,conf,sites}-enabled/*; do
+        if [[ -L "$link" && ! -e "$link" ]]; then
+            print warning "Removing broken Apache link: $link"
+            rm -f "$link"
+        fi
+    done
+    # Only when the config is already broken, and only for plain absolute paths
+    # (quotes stripped); anything else is left to Apache rather than guessed at.
+    if ! apache2ctl configtest >/dev/null 2>&1; then
+    for mod_load in /etc/apache2/mods-enabled/*.load; do
+        [[ -e "$mod_load" ]] || continue
+        so=$(awk '$1 == "LoadModule" {gsub(/"/, "", $3); print $3; exit}' "$mod_load")
+        [[ "$so" == /* && "$so" != *'$'* ]] || continue
+        if [[ ! -f "$so" ]]; then
+            print warning "Disabling Apache module $(basename "$mod_load" .load): $so is missing"
+            a2dismod -f "$(basename "$mod_load" .load)" || true
+        fi
+    done
+    fi
+
     # Check and configure modules (idempotent)
-    if apache2ctl -M | grep -q "mpm_event_module"; then
+    if apache2ctl -M 2>/dev/null | grep -q "mpm_event_module"; then
         print info "Disabling mpm_event module..."
         a2dismod mpm_event
     fi
 
     # Enable required modules if not already enabled
-    local required_modules=(rewrite headers deflate env mpm_prefork)
-    for module in "${required_modules[@]}"; do
-        if ! apache2ctl -M | grep -q "${module}_module"; then
+    local module
+    for module in "${APACHE_REQUIRED_MODULES[@]}"; do
+        if ! apache2ctl -M 2>/dev/null | grep -q "${module}_module"; then
             print info "Enabling Apache module: $module"
             a2enmod $module
         else
@@ -310,13 +409,10 @@ install_apache() {
     # Restart only if needed
     if ! systemctl is-active apache2 >/dev/null 2>&1; then
         print info "Starting Apache service..."
-        service apache2 start
+        service apache2 start || apache_start_failed
     else
         print info "Restarting Apache to apply any changes..."
-        service apache2 restart || {
-            print error "Failed to restart Apache2. Exiting..."
-            exit 1
-        }
+        service apache2 restart || apache_start_failed
     fi
 }
 
@@ -422,8 +518,24 @@ setup_web_permissions() {
 # MYSQL SETUP FUNCTIONS
 #=============================================================================
 
+# MariaDB is not a drop-in for the apps this sets up (MySQL 8 collations such as
+# utf8mb4_0900_ai_ci and the ->> JSON operator). Replacing it automatically could
+# discard a lab's data, so stop and say what to do instead.
+refuse_mariadb() {
+    pkg_installed 'mariadb-server*' || return 0
+    print error "MariaDB is installed. This setup needs MySQL 8; MariaDB is not compatible."
+    print info "If the MariaDB databases are needed, back them up first:"
+    print info "  sudo mysqldump --all-databases > ~/mariadb-backup.sql"
+    print info "Then remove MariaDB (this deletes its databases):"
+    print info "  sudo apt-get purge -y 'mariadb-*' && sudo rm -rf /var/lib/mysql /etc/mysql"
+    print info "and run setup again."
+    log_action "MariaDB installed; setup stopped (MySQL 8 required)"
+    exit 1
+}
+
 get_mysql_password() {
     print header "Setting up MySQL credentials..."
+    refuse_mariadb
 
     mysql_root_password=""
     mysql_root_password_confirm=""
@@ -492,8 +604,10 @@ EOF
         chmod 600 ~/.my.cnf
 
         # Verify MySQL password
-        if command -v mysql &>/dev/null; then
+        if mysql_server_intact; then
             print info "MySQL is already installed. Verifying password..."
+            # A stopped server fails every ping and would loop here forever.
+            service mysql start &>/dev/null || systemctl start mysql &>/dev/null || true
             if mysqladmin ping -u root -p"${mysql_root_password}" &>/dev/null; then
                 print success "Password verified."
                 break
@@ -578,12 +692,45 @@ enforce_mysql_root_password() {
     exit 1
 }
 
+# True when the MySQL SERVER is installed with its config. `command -v mysql`
+# only proves the client exists, which survives removing the server. The unit
+# file belongs to the server package (mysql-server-8.0 / -8.4), so it also
+# catches a removed server whose core package and conffiles were left behind.
+# 'mysql-server-*' matches both versioned core names and 26.04's unversioned
+# mysql-server-core; 'mysql-community-server*' is Oracle's own APT repo.
+# MariaDB never reaches here: refuse_mariadb stops setup first.
+mysql_server_intact() {
+    command -v mysqld &>/dev/null &&
+        [[ -f /etc/mysql/my.cnf ]] &&
+        [[ -f /etc/mysql/mysql.conf.d/mysqld.cnf ]] &&
+        [[ -d /etc/mysql/conf.d ]] &&
+        [[ -f /lib/systemd/system/mysql.service || -f /usr/lib/systemd/system/mysql.service ]] &&
+        { pkg_installed 'mysql-server-*' || pkg_installed 'mysql-community-server*'; }
+}
+
 install_mysql() {
-    if ! command -v mysql &>/dev/null; then
+    if mysql_server_intact; then
+        :
+    elif command -v mysqld &>/dev/null || [[ -d /etc/mysql ]]; then
+        print warning "MySQL server is partly installed (files missing). Repairing..."
+        log_action "MySQL partly installed; reinstalling with --force-confmiss"
+        local mysql_pkgs
+        mapfile -t mysql_pkgs < <(installed_pkgs 'mysql-server-*' 'mysql-community-server*' 'mysql-common')
+        apt-get install -y --reinstall -o Dpkg::Options::="--force-confmiss" \
+            mysql-server "${mysql_pkgs[@]}" || true
+    else
         print header "Installing MySQL..."
         apt-get install -y mysql-server
-        service mysql start &>/dev/null || systemctl start mysql &>/dev/null || true
     fi
+    if ! mysql_server_intact; then
+        print error "MySQL server is not installed correctly and automatic repair did not fix it."
+        print info "Repair it with:"
+        print info "  sudo apt-get install -y --reinstall mysql-server"
+        print info "then run setup again."
+        log_action "MySQL server still missing after install/repair attempt"
+        exit 1
+    fi
+    service mysql start &>/dev/null || systemctl start mysql &>/dev/null || true
 
     # Always (re-)assert password auth, even when MySQL was already installed, so
     # a prior run that left root on auth_socket self-heals on the next run.
@@ -792,11 +939,7 @@ configure_phpmyadmin_apache() {
         }
         { print }' ${config_file} >tmpfile && mv tmpfile ${config_file}
 
-        service apache2 restart || {
-            print error "Failed to restart Apache2. Exiting..."
-            log_action "Failed to restart Apache2. Exiting..."
-            exit 1
-        }
+        service apache2 restart || apache_start_failed
     fi
 }
 
@@ -859,11 +1002,7 @@ main() {
     configure_phpmyadmin_apache
 
     # Final restart and completion
-    service apache2 restart || {
-        print error "Failed to restart Apache2. Exiting..."
-        log_action "Failed to restart Apache2. Exiting..."
-        exit 1
-    }
+    service apache2 restart || apache_start_failed
 
     log_action "LAMP Setup complete."
     print success "LAMP Setup complete successfully!"
