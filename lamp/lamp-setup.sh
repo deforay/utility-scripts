@@ -158,12 +158,75 @@ check_dependencies() {
 # SYSTEM SETUP FUNCTIONS
 #=============================================================================
 
+# apt-get update, but an unreadable third-party source file (e.g. a malformed
+# teamviewer.list, which makes apt refuse to run at all) no longer stops setup:
+# that file is moved to /root/apt-sources-disabled and the update retried.
+# Only files apt itself names as unparseable are moved, and never the distro's
+# own sources or a Launchpad PPA (setup needs ondrej). Every other apt error
+# (missing Release file, conflicting options, unsigned repo) is reported with
+# the files to look at, because guessing which entry is broken could disable a
+# healthy or required source.
+APT_DISABLED_DIR=/root/apt-sources-disabled
+
+apt_update_or_heal() {
+    local out file attempt
+    local -a bad
+    for attempt in 1 2 3 4; do
+        if out=$(apt-get update 2>&1); then
+            return 0
+        fi
+        ((attempt < 4)) || break
+        mapfile -t bad < <(grep -E '^E: (Malformed|Type .* is not known|Unable to parse)' <<<"$out" |
+            grep -oE '/etc/apt/sources\.list\.d/[^ :()]+' | sort -u || true)
+        local -a movable=()
+        for file in "${bad[@]}"; do
+            [[ -f "$file" ]] || continue
+            if [[ "$file" =~ /(ubuntu|debian)\.sources$ ]] || grep -qE 'launchpad(content)?\.net|ppa\.launchpad' "$file"; then
+                continue
+            fi
+            movable+=("$file")
+        done
+        if ((${#movable[@]} == 0)); then
+            # Download failures alone (flaky link, mirror hiccup) are not a broken
+            # source: apt keeps the previous lists, so warn and carry on.
+            if ! grep -E '^E:' <<<"$out" | grep -qvE 'Failed to fetch|Some index files failed to download'; then
+                print warning "Some package lists could not be downloaded (network?); continuing with cached lists."
+                grep -E '^E: Failed to fetch' <<<"$out" | head -n 5 || true
+                log_action "apt-get update: download failures ignored"
+                return 0
+            fi
+            break
+        fi
+        mkdir -p "$APT_DISABLED_DIR"
+        for file in "${movable[@]}"; do
+            print warning "Disabling unreadable apt source: $file (moved to $APT_DISABLED_DIR)"
+            log_action "Disabled unreadable apt source $file"
+            mv -f "$file" "$APT_DISABLED_DIR/"
+        done
+    done
+
+    print error "Updating the package list failed, and the cause could not be fixed automatically:"
+    grep -E '^(E|W):' <<<"$out" | head -n 10 || true
+    # Errors like "Conflicting values ... regarding source URL" name no file; list
+    # the files that mention each repository so the operator knows where to look.
+    local url files
+    while IFS= read -r url; do
+        files=$(grep -lF -- "$url" /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null | tr '\n' ' ')
+        [[ -n "$files" ]] && print info "Files mentioning ${url}: ${files}"
+    done < <(grep -E '^E:' <<<"$out" | grep -oE 'https?://[^ /]+(/[^ ]*)?' | sed -E 's#/(dists|InRelease|Release)(/.*)?$##; s#/$##' | sort -u || true)
+    print info "Fix or remove the source file mentioned above (in /etc/apt/sources.list or /etc/apt/sources.list.d/),"
+    print info "for example: sudo mv /etc/apt/sources.list.d/<file> /root/  then run setup again."
+    log_action "apt-get update failed: $(grep -E '^E:' <<<"$out" | head -n 1 || true)"
+    exit 1
+}
+
 setup_system() {
     print header "Setting up system basics..."
 
     # Update Ubuntu Packages (always safe to run)
     print info "Updating Ubuntu packages..."
-    apt-get update && apt-get upgrade -y
+    apt_update_or_heal
+    apt-get upgrade -y
 
     # Configure any packages that were not fully installed (always safe)
     print info "Configuring any partially installed packages..."
@@ -533,9 +596,64 @@ refuse_mariadb() {
     exit 1
 }
 
+# Up = accepting connections. mysqladmin ping reports "alive" even when access
+# is denied, which is exactly what this needs and why it must never be used to
+# test a password.
+mysql_alive() {
+    mysqladmin --no-defaults ping &>/dev/null
+}
+
+# Does this root password work? Runs a statement; --no-defaults (first) so a
+# stale /root/.my.cnf cannot answer instead. Root on auth_socket accepts OS root
+# whatever the password, and enforce_mysql_root_password then sets it.
+mysql_root_password_works() {
+    [[ -n "$1" ]] && mysql --no-defaults -u root -p"$1" -e 'SELECT 1' &>/dev/null
+}
+
+# Installed MySQL must be running before credentials mean anything. If it will
+# not start, prompting for passwords would loop forever, so explain and stop.
+ensure_mysql_running() {
+    mysql_alive && return 0
+    service mysql start &>/dev/null || systemctl start mysql &>/dev/null || true
+    local i
+    for i in $(seq 1 20); do
+        mysql_alive && return 0
+        sleep 1
+    done
+    print error "MySQL is installed but is not running and could not be started."
+    systemctl status mysql --no-pager 2>/dev/null | head -n 8 || true
+    print info "Last MySQL log lines:"
+    journalctl -u mysql --no-pager -n 20 2>/dev/null || tail -n 20 /var/log/mysql/error.log 2>/dev/null || true
+    print info "If this PC has no MySQL data to keep, reinstall MySQL from scratch (deletes its databases):"
+    print info "  sudo systemctl stop mysql; sudo apt-get purge -y 'mysql-server*' mysql-common"
+    print info "  sudo rm -rf /var/lib/mysql /etc/mysql && sudo apt-get install -y mysql-server"
+    print info "then run setup again."
+    log_action "MySQL installed but not running; setup stopped"
+    exit 1
+}
+
+mysql_password_reset_help() {
+    print error "The MySQL root password was not accepted after 3 attempts."
+    print info "An earlier install may have recorded it (e.g. /var/www/intelis/configs/config.production.php)."
+    print info "If root can still log in over the socket, set a new one:"
+    print info "  sudo mysql --no-defaults -e \"ALTER USER 'root'@'localhost' IDENTIFIED WITH caching_sha2_password BY 'NewPassword'; FLUSH PRIVILEGES;\""
+    print info "If that is refused and this PC has no MySQL data to keep, reinstall MySQL (deletes its databases):"
+    print info "  sudo systemctl stop mysql; sudo apt-get purge -y 'mysql-server*' mysql-common"
+    print info "  sudo rm -rf /var/lib/mysql /etc/mysql && sudo apt-get install -y mysql-server"
+    print info "then run setup again."
+    log_action "MySQL root password rejected 3 times; setup stopped"
+    exit 1
+}
+
 get_mysql_password() {
     print header "Setting up MySQL credentials..."
     refuse_mariadb
+
+    local server_present=false
+    if mysql_server_intact; then
+        server_present=true
+        ensure_mysql_running
+    fi
 
     mysql_root_password=""
     mysql_root_password_confirm=""
@@ -548,8 +666,8 @@ get_mysql_password() {
     # install step sets root to this value.
     if [ -n "${MYSQL_ROOT_PASSWORD:-}" ]; then
         mysql_root_password="${MYSQL_ROOT_PASSWORD}"
-        if command -v mysqladmin &>/dev/null && ! mysqladmin ping -u root -p"${mysql_root_password}" &>/dev/null; then
-            print warning "Caller-supplied MySQL password did not verify against the running server; prompting."
+        if $server_present && ! mysql_root_password_works "${mysql_root_password}"; then
+            print warning "The MySQL root password entered earlier does not work on the MySQL already installed here; prompting."
             mysql_root_password=""
         else
             print info "Using MySQL root password supplied by the caller."
@@ -570,7 +688,7 @@ EOF
         mysql_root_password=$(awk -F= '/^password[[:space:]]*=/{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' ~/.my.cnf)
         if [ -n "$mysql_root_password" ]; then
             print info "Found existing MySQL credentials in ~/.my.cnf; verifying..."
-            if command -v mysqladmin &>/dev/null && mysqladmin ping -u root -p"${mysql_root_password}" &>/dev/null; then
+            if ! $server_present || mysql_root_password_works "${mysql_root_password}"; then
                 print success "Reusing MySQL root password from ~/.my.cnf"
                 return
             else
@@ -580,6 +698,7 @@ EOF
         fi
     fi
 
+    local attempts=0
     while :; do
         while [ -z "${mysql_root_password}" ] || [ "${mysql_root_password}" != "${mysql_root_password_confirm}" ]; do
             read -sp "Please enter the MySQL root password (cannot be blank): " mysql_root_password
@@ -604,18 +723,17 @@ EOF
         chmod 600 ~/.my.cnf
 
         # Verify MySQL password
-        if mysql_server_intact; then
+        if $server_present; then
             print info "MySQL is already installed. Verifying password..."
-            # A stopped server fails every ping and would loop here forever.
-            service mysql start &>/dev/null || systemctl start mysql &>/dev/null || true
-            if mysqladmin ping -u root -p"${mysql_root_password}" &>/dev/null; then
+            if mysql_root_password_works "${mysql_root_password}"; then
                 print success "Password verified."
                 break
-            else
-                print warning "Password incorrect or MySQL server unreachable. Please try again."
-                mysql_root_password=""
-                mysql_root_password_confirm=""
             fi
+            attempts=$((attempts + 1))
+            ((attempts >= 3)) && mysql_password_reset_help
+            print warning "That is not the root password of the MySQL installed here. Please try again."
+            mysql_root_password=""
+            mysql_root_password_confirm=""
         else
             break # MySQL not installed, continue to installation
         fi
