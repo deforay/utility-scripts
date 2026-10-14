@@ -420,9 +420,15 @@ heal_php_module() {
         elif [[ -n "$so_dir" && -f "${so_dir}/${module}.so" ]]; then
             warn "Recreating missing ${ini}"
             mkdir -p "$(dirname "$ini")"
-            printf '; configuration for php %s module\n; priority=20\nextension=%s.so\n' "$module" "$module" >"$ini"
+            if [[ "$module" == opcache ]]; then
+                printf '; configuration for php opcache module\n; priority=10\nzend_extension=opcache.so\n' >"$ini"
+            else
+                printf '; configuration for php %s module\n; priority=20\nextension=%s.so\n' "$module" "$module" >"$ini"
+            fi
         fi
     fi
+    # Only called for modules the apps cannot run without (phar, and the
+    # verify list), so this deliberately overrides an admin's phpdismod.
     if [[ -f "$ini" ]]; then
         phpenmod -v "$version" -s ALL "$module" 2>/dev/null || true
     fi
@@ -439,13 +445,45 @@ heal_all_php_modules() {
         [[ -f "/etc/php/${version}/mods-available/${module}.ini" ]] && continue
         mkdir -p "/etc/php/${version}/mods-available"
         cp "$template" "/etc/php/${version}/mods-available/${module}.ini"
-        phpenmod -v "$version" -s ALL "$module" 2>/dev/null || true
+        # -m (maintainer mode, as the package's postinst uses) leaves modules an
+        # admin disabled on purpose disabled.
+        phpenmod -m -v "$version" -s ALL "$module" 2>/dev/null || true
         healed=$((healed + 1))
         warn "Restored missing PHP ${version} module config: ${module}"
     done
+
+    # Second pass: separately packaged extensions (apcu, igbinary, redis, ...)
+    # ship their .ini as a real dpkg conffile with no template, so for any .so
+    # left without an .ini, reinstall its package restoring missing conffiles.
+    local ext_dir so pkg
+    local -a pkgs=() orphans=()
+    ext_dir=$("/usr/bin/php${version}" -n -r 'echo ini_get("extension_dir");' 2>/dev/null || true)
+    if [[ -n "$ext_dir" && -d "$ext_dir" ]]; then
+        for so in "$ext_dir"/*.so; do
+            module=$(basename "$so" .so)
+            [[ -f "/etc/php/${version}/mods-available/${module}.ini" ]] && continue
+            pkg=$(dpkg -S "$so" 2>/dev/null | head -n 1 | cut -d: -f1 || true)
+            if [[ "$pkg" == php${version}-* ]]; then
+                pkgs+=("$pkg")
+                orphans+=("$module")
+            fi
+        done
+    fi
     shopt -u nullglob
+    if ((${#pkgs[@]} > 0)); then
+        mapfile -t pkgs < <(printf '%s\n' "${pkgs[@]}" | sort -u)
+        warn "Restoring missing module configs from: ${pkgs[*]}"
+        run_with_retry apt-get install --reinstall -y -o Dpkg::Options::="--force-confmiss" "${pkgs[@]}" || true
+        for module in "${orphans[@]}"; do
+            if [[ -f "/etc/php/${version}/mods-available/${module}.ini" ]]; then
+                phpenmod -m -v "$version" -s ALL "$module" 2>/dev/null || true
+            fi
+        done
+        healed=$((healed + ${#pkgs[@]}))
+    fi
+
     if ((healed > 0)); then
-        info "Restored ${healed} missing PHP ${version} module config file(s)."
+        info "Restored missing PHP ${version} module configs (${healed} item(s))."
     fi
 }
 

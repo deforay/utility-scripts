@@ -959,25 +959,37 @@ install_php() {
     local force_flag=${2:-}
     print header "Installing and configuring PHP $php_version..."
 
-    # Download switch-php script if not already present or in force mode
-    if [ ! -f "/usr/local/bin/switch-php" ] || [ "$force_flag" = "-f" ] || [ "$force_flag" = "--force" ]; then
-        print info "Downloading switch-php script..."
-        wget https://raw.githubusercontent.com/deforay/utility-scripts/master/php/switch-php -O /usr/local/bin/switch-php
-        chmod u+x /usr/local/bin/switch-php
-    else
-        print info "switch-php script already exists"
-    fi
-
     # Check if the specific PHP version is already active and not in force mode
     if [ "$force_flag" != "-f" ] && [ "$force_flag" != "--force" ]; then
         if command -v php &>/dev/null; then
             current_version=$(php -v | head -n1 | grep -oP 'PHP \K[0-9]+\.[0-9]+')
-            if [ "$current_version" == "$php_version" ]; then
-                print info "PHP $php_version is already active"
+            # Active is not enough: a wiped /etc/php leaves the right version
+            # with phar/mbstring/... unloaded, which switch-php repairs.
+            if [ "$current_version" == "$php_version" ] &&
+                php -r 'foreach (["phar","mbstring","curl","zip","mysqli","pdo_mysql","intl","gd","xml"] as $e) { if (!extension_loaded($e)) exit(1); }' &>/dev/null; then
+                print info "PHP $php_version is already active with its required extensions"
                 return 0
             fi
         fi
     fi
+
+    # Always fetch the current switch-php: an old copy left from an earlier run
+    # would miss later repairs. Offline, keep whatever copy is there. Done only
+    # once switch-php is needed, so a healthy offline machine does not fail here.
+    print info "Downloading switch-php script..."
+    local switch_tmp
+    switch_tmp=$(mktemp)
+    if wget -q https://raw.githubusercontent.com/deforay/utility-scripts/master/php/switch-php -O "$switch_tmp" &&
+        bash -n "$switch_tmp" 2>/dev/null; then
+        install -m 0755 "$switch_tmp" /usr/local/bin/switch-php
+    elif [ -f /usr/local/bin/switch-php ]; then
+        print warning "Could not download switch-php; using the existing copy."
+    else
+        rm -f "$switch_tmp"
+        print error "Could not download switch-php and no copy is installed. Check the internet connection and run setup again."
+        exit 1
+    fi
+    rm -f "$switch_tmp"
 
     # Run switch-php with or without force flag
     if [ "$force_flag" = "-f" ] || [ "$force_flag" = "--force" ]; then
