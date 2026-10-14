@@ -635,6 +635,21 @@ verify_and_install_extensions() {
 
 verify_and_install_extensions "$PHP_VERSION"
 
+# The checks above look at the CLI only. A required module can still be off
+# for Apache (per-SAPI phpdismod, or kept off by the -m sweep), so enable the
+# required set for every SAPI. Deliberately overrides an admin's phpdismod:
+# the apps do not run without these.
+enable_required_modules_everywhere() {
+    local version="$1" module
+    for module in phar curl gd mbstring xml zip mysqli pdo_mysql bcmath intl gmp opcache sqlite3 imagick; do
+        if [[ -f "/etc/php/${version}/mods-available/${module}.ini" ]]; then
+            phpenmod -v "$version" -s ALL "$module" 2>/dev/null || true
+        fi
+    done
+}
+
+enable_required_modules_everywhere "$PHP_VERSION"
+
 # --- Configuration (The Idempotent Way) ---
 
 configure_php_tuning() {

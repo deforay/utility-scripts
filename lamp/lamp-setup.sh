@@ -966,7 +966,7 @@ install_php() {
             # Active is not enough: a wiped /etc/php leaves the right version
             # with phar/mbstring/... unloaded, which switch-php repairs.
             if [ "$current_version" == "$php_version" ] &&
-                php -r 'foreach (["phar","mbstring","curl","zip","mysqli","pdo_mysql","intl","gd","xml"] as $e) { if (!extension_loaded($e)) exit(1); }' &>/dev/null; then
+                php -r 'foreach (["phar","mbstring","curl","zip","mysqli","pdo_mysql","intl","gd","xml","bcmath","gmp","sqlite3","Zend OPcache"] as $e) { if (!extension_loaded($e)) exit(1); }' &>/dev/null; then
                 print info "PHP $php_version is already active with its required extensions"
                 return 0
             fi
