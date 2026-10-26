@@ -563,12 +563,18 @@ EOF
 setup_web_permissions() {
     print info "Setting up web directory permissions..."
 
+    # Under sudo, $USER is root; grant the person who ran sudo instead.
+    local web_user=${SUDO_USER:-$USER}
+
     # Check if directory exists and has proper permissions
     if [ -d "/var/www" ]; then
         # Only set permissions if they're not already correct
-        if ! getfacl /var/www 2>/dev/null | grep -q "user:www-data:rwx"; then
+        local acl
+        acl=$(getfacl /var/www 2>/dev/null)
+        if ! grep -q "user:www-data:rwx" <<<"$acl" ||
+            { [ "$web_user" != "root" ] && ! grep -q "user:${web_user}:rwx" <<<"$acl"; }; then
             print info "Setting ACL permissions for /var/www..."
-            setfacl -R -m u:$USER:rwx,u:www-data:rwx /var/www
+            setfacl -R -m u:${web_user}:rwx,u:www-data:rwx /var/www
         else
             print info "Web directory permissions already configured"
         fi
