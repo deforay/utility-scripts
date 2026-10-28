@@ -534,9 +534,10 @@ configure_basic_performance() {
     if [ ! -f "$config_file" ]; then
         print info "Creating basic performance configuration..."
         cat >"$config_file" <<'EOF'
-# Enable compression
+# Enable compression. JSON too: API and sync answers are JSON, and uncompressed
+# they can be ten times the size on the wire.
 <IfModule mod_deflate.c>
-    AddOutputFilterByType DEFLATE text/html text/plain text/xml text/css text/javascript application/javascript
+    AddOutputFilterByType DEFLATE text/html text/plain text/xml text/css text/javascript application/javascript application/json
 </IfModule>
 
 # Basic security headers
