@@ -276,10 +276,14 @@ setup_system() {
     fi
 }
 
+# False only when Launchpad answers that it does not publish <codename> (404).
+# A timeout or a dropped connection used to count as "no build" and disabled
+# the PPA for good on a slow link. Without an answer, the PPA stays.
 ppa_has_codename() {
-    local ppa_path="$1" cn="$2"
-    curl -fsSLI -o /dev/null --max-time 10 \
-        "https://ppa.launchpadcontent.net/${ppa_path}/ubuntu/dists/${cn}/Release" 2>/dev/null
+    local ppa_path="$1" cn="$2" code
+    code=$(curl -sSLI -o /dev/null --max-time 20 --retry 2 --retry-delay 2 -w '%{http_code}' \
+        "https://ppa.launchpadcontent.net/${ppa_path}/ubuntu/dists/${cn}/Release" 2>/dev/null) || true
+    [[ "${code:-000}" != "404" ]]
 }
 
 # If ondrej/apache2 doesn't publish $codename, disable its source files so apt

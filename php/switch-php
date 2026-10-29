@@ -157,10 +157,24 @@ ensure_base_tools() {
 
 # HEAD-probe a Launchpad PPA Release URL for the given codename. Returns 0
 # if published, 1 otherwise. curl noise is suppressed (-f alone leaks to stderr).
+# Launchpad's status for <ppa>'s Release file on <codename>: 200, 404, or 000
+# when no answer came back at all (timeout, DNS, dropped connection).
+PPA_BASE_URL="${PPA_BASE_URL:-https://ppa.launchpadcontent.net}"
+ppa_release_status() {
+    local ppa_path="$1" cn="$2" code
+    code=$(curl -sSLI -o /dev/null --max-time 20 --retry 2 --retry-delay 2 -w '%{http_code}' \
+        "${PPA_BASE_URL}/${ppa_path}/ubuntu/dists/${cn}/Release" 2>/dev/null) || true
+    printf '%s' "${code:-000}"
+}
+
+# False only when Launchpad answers that it does not publish <codename>.
+#
+# This used to be false on any failed request. Launchpad is often slow, and on
+# a slow link one timeout read as "no build": the PPA was disabled for good
+# (see setup_ppa) and PHP 8.4 could not be installed on Ubuntu 24.04, which
+# ships only 8.3. Without an answer, the PPA stays as it is.
 ppa_has_codename() {
-    local ppa_path="$1" cn="$2"
-    curl -fsSLI -o /dev/null --max-time 10 \
-        "https://ppa.launchpadcontent.net/${ppa_path}/ubuntu/dists/${cn}/Release" 2>/dev/null
+    [[ "$(ppa_release_status "$1" "$2")" != "404" ]]
 }
 
 # Derive "ondrej/<pkg>" from a sources filename of the form
@@ -195,6 +209,22 @@ setup_ppa() {
     local ppa_sources="/etc/apt/sources.list.d/ondrej-ubuntu-php-${codename}.sources"
 
     if [[ -f "${ppa_list}.disabled" || -f "${ppa_sources}.disabled" ]]; then
+        # A one-off timeout used to disable the PPA here (see ppa_has_codename).
+        # When the PHP asked for is not in Ubuntu's archive and Launchpad
+        # confirms it publishes this release, the PPA is what is needed: turn it
+        # back on rather than fail.
+        if ! is_package_available "php${PHP_VERSION}" &&
+            [[ "$(ppa_release_status "$ppa_name" "$codename")" == "200" ]]; then
+            local f
+            for f in "${ppa_list}.disabled" "${ppa_sources}.disabled"; do
+                [[ -f "$f" ]] || continue
+                mv "$f" "${f%.disabled}"
+                restore_ondrej_source_codename "${f%.disabled}" "$codename"
+            done
+            info "Turned ${ppa_name} back on: PHP ${PHP_VERSION} is not in Ubuntu's archive, and the PPA has it."
+            SKIP_UPDATE=false
+            return 0
+        fi
         info "${ppa_name} previously disabled on '${codename}'; using distro PHP packages."
         return 0
     fi
