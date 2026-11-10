@@ -901,7 +901,8 @@ install_composer() {
         error "Failed to download Composer."
         return 1
     fi
-    chmod +x /usr/local/bin/composer
+    # 0755, not +x: under a 077 root umask +x gives 0700 and www-data cannot run it.
+    chmod 0755 /usr/local/bin/composer
 }
 
 install_composer || warn "Composer installation failed; install manually later if needed."
