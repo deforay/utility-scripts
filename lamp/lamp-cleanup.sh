@@ -13,9 +13,30 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# This script is destructive and irreversible: it deletes ALL databases
+# (/var/lib/mysql), ALL web content (/var/www), and the Apache/PHP/MySQL
+# configuration. Require an explicit typed confirmation unless -y/--yes is given.
+ASSUME_YES=false
+case "${1:-}" in
+    -y | --yes) ASSUME_YES=true ;;
+esac
+
+if [ "$ASSUME_YES" != "true" ]; then
+    echo "WARNING: this will PERMANENTLY DELETE:"
+    echo "  - all MySQL databases in /var/lib/mysql"
+    echo "  - all web content in /var/www"
+    echo "  - Apache, PHP, MySQL and phpMyAdmin packages and their configuration"
+    echo
+    read -rp "There is no undo. Type 'yes' to continue: " confirm
+    if [ "$confirm" != "yes" ]; then
+        echo "Aborted. Nothing was changed."
+        exit 0
+    fi
+fi
+
 # Purge MySQL, PHP, Apache, and phpMyAdmin
 apt-get purge --auto-remove -y mysql-server mysql-client mysql-common mysql-server-core-* mysql-client-core-*
-apt-get purge --auto-remove -y php7.4* php 8.2* php8.3* php8.4* php8.5* php* 
+apt-get purge --auto-remove -y php7.4* php8.2* php8.3* php8.4* php8.5* php*
 apt-get purge --auto-remove -y apache2* libapache2-mod-php* phpmyadmin composer
 
 # Stop services before removing files
