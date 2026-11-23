@@ -155,133 +155,49 @@ ensure_base_tools() {
     fi
 }
 
-# HEAD-probe a Launchpad PPA Release URL for the given codename. Returns 0
-# if published, 1 otherwise. curl noise is suppressed (-f alone leaks to stderr).
-# Launchpad's status for <ppa>'s Release file on <codename>: 200, 404, or 000
-# when no answer came back at all (timeout, DNS, dropped connection).
-PPA_BASE_URL="${PPA_BASE_URL:-https://ppa.launchpadcontent.net}"
-ppa_release_status() {
-    local ppa_path="$1" cn="$2" code
-    code=$(curl -sSLI -o /dev/null --max-time 20 --retry 2 --retry-delay 2 -w '%{http_code}' \
-        "${PPA_BASE_URL}/${ppa_path}/ubuntu/dists/${cn}/Release" 2>/dev/null) || true
-    printf '%s' "${code:-000}"
-}
+# Ondrej's Launchpad PPAs are frozen. PHP and Apache are now published at
+# packages.sury.org (https://packages.sury.org/php/README.txt).
+SURY_KEYRING=/usr/share/keyrings/debsuryorg-archive-keyring.gpg
 
-# False only when Launchpad answers that it does not publish <codename>.
-#
-# This used to be false on any failed request. Launchpad is often slow, and on
-# a slow link one timeout read as "no build": the PPA was disabled for good
-# (see setup_ppa) and PHP 8.4 could not be installed on Ubuntu 24.04, which
-# ships only 8.3. Without an answer, the PPA stays as it is.
-ppa_has_codename() {
-    [[ "$(ppa_release_status "$1" "$2")" != "404" ]]
-}
-
-# Derive "ondrej/<pkg>" from a sources filename of the form
-# /etc/apt/sources.list.d/ondrej-ubuntu-<pkg>-<codename>.{list,sources}
-ondrej_ppa_path_from_file() {
-    local file="$1" codename="$2" base ppa_path
-    base=$(basename "$file")
-    ppa_path="ondrej/${base#ondrej-ubuntu-}"
-    ppa_path="${ppa_path%-${codename}.list}"
-    ppa_path="${ppa_path%-${codename}.sources}"
-    printf '%s\n' "$ppa_path"
-}
-
-# Restore the codename written *inside* an ondrej source file (it may have been
-# rewritten by a previous version of this script). Operates by filename suffix.
-restore_ondrej_source_codename() {
-    local file="$1" codename="$2"
-    case "$file" in
-        *.sources) sed -i -E "s/^(Suites:[[:space:]]*).*/\1${codename}/" "$file" 2>/dev/null || true ;;
-        *.list)    sed -i -E "s|(ubuntu[[:space:]]+)[a-zA-Z]+([[:space:]]+main)|\1${codename}\2|" "$file" 2>/dev/null || true ;;
-    esac
-}
-
-# Add ondrej/php PPA if it publishes the current codename. If not, do nothing —
-# install_php_packages will fall back to Ubuntu's stock PHP. Respect a prior
-# .disabled marker so we don't re-add a PPA the user opted out of.
-setup_ppa() {
-    local ppa_name="ondrej/php"
-    local codename
+# Use packages.sury.org/<component> for this Ubuntu release, and retire the frozen
+# ondrej/<component> PPA as its notice says. Installed packages stay and get their next
+# updates from sury. When sury answers 404 for this release, the distro packages are used.
+# A timeout or a 5xx still adds the repository: only a 404 means "no build".
+use_sury_repo() {
+    local component="$1" codename code
     codename=$(lsb_release -cs)
-    local ppa_list="/etc/apt/sources.list.d/ondrej-ubuntu-php-${codename}.list"
-    local ppa_sources="/etc/apt/sources.list.d/ondrej-ubuntu-php-${codename}.sources"
 
-    if [[ -f "${ppa_list}.disabled" || -f "${ppa_sources}.disabled" ]]; then
-        # A one-off timeout used to disable the PPA here (see ppa_has_codename).
-        # When the PHP asked for is not in Ubuntu's archive and Launchpad
-        # confirms it publishes this release, the PPA is what is needed: turn it
-        # back on rather than fail.
-        if ! is_package_available "php${PHP_VERSION}" &&
-            [[ "$(ppa_release_status "$ppa_name" "$codename")" == "200" ]]; then
-            local f
-            for f in "${ppa_list}.disabled" "${ppa_sources}.disabled"; do
-                [[ -f "$f" ]] || continue
-                mv "$f" "${f%.disabled}"
-                restore_ondrej_source_codename "${f%.disabled}" "$codename"
-            done
-            info "Turned ${ppa_name} back on: PHP ${PHP_VERSION} is not in Ubuntu's archive, and the PPA has it."
-            SKIP_UPDATE=false
-            return 0
-        fi
-        info "${ppa_name} previously disabled on '${codename}'; using distro PHP packages."
-        return 0
-    fi
-
-    if [[ -f "$ppa_list" || -f "$ppa_sources" ]]; then
-        info "PPA $ppa_name already present."
-        return 0
-    fi
-
-    if ! ppa_has_codename "$ppa_name" "$codename"; then
-        warn "${ppa_name} has no build for '${codename}'; skipping PPA, using distro PHP packages."
-        return 0
-    fi
-
-    info "Adding PPA: $ppa_name"
-    run_with_retry add-apt-repository -y ppa:$ppa_name
-    SKIP_UPDATE=false
-}
-
-# Disable any ondrej-ubuntu-*-<codename>.{list,sources} whose codename isn't
-# published by Launchpad. Cross-codename installs break due to ABI mismatches
-# (e.g. the libxml2 time_t-64 transition), so we don't try to pin to a prior
-# Ubuntu — we step out of the way and let apt use the distro archive.
-# Covers ondrej/php (added here) and ondrej/apache2 (added by lamp-setup.sh).
-disable_unsupported_ondrej_ppas() {
-    local codename
-    codename=$(lsb_release -cs)
-    shopt -s nullglob
-    local files=(/etc/apt/sources.list.d/ondrej-ubuntu-*-"${codename}".list \
-                 /etc/apt/sources.list.d/ondrej-ubuntu-*-"${codename}".sources)
-    shopt -u nullglob
-    [[ ${#files[@]} -eq 0 ]] && return 0
-
-    declare -A checked=()
-    local file ppa_path
-    for file in "${files[@]}"; do
-        ppa_path=$(ondrej_ppa_path_from_file "$file" "$codename")
-
-        if [[ -z "${checked[$ppa_path]:-}" ]]; then
-            if ppa_has_codename "$ppa_path" "$codename"; then
-                checked[$ppa_path]="ok"
-            else
-                checked[$ppa_path]="bad"
-            fi
-        fi
-
-        if [[ "${checked[$ppa_path]}" == "ok" ]]; then
-            # Heal a previous noble-pin so the file matches its own filename.
-            restore_ondrej_source_codename "$file" "$codename"
-            continue
-        fi
-
-        warn "${ppa_path} has no build for '${codename}'; disabling PPA, falling back to distro packages."
-        restore_ondrej_source_codename "$file" "$codename"
-        mv "$file" "${file}.disabled"
+    local f
+    for f in /etc/apt/sources.list.d/ondrej-ubuntu-"${component}"-*; do
+        [[ -e "$f" ]] || continue
+        rm -f "$f"
+        info "Removed frozen PPA source $(basename "$f")"
         SKIP_UPDATE=false
     done
+
+    if grep -rqs "packages\.sury\.org/${component}" /etc/apt/sources.list /etc/apt/sources.list.d/; then
+        info "packages.sury.org/${component} already configured."
+        return 0
+    fi
+
+    code=$(curl -sSLI -o /dev/null --max-time 20 --retry 3 --retry-delay 2 -w '%{http_code}' \
+        "https://packages.sury.org/${component}/dists/${codename}/Release" 2>/dev/null) || true
+    if [[ "$code" == "404" ]]; then
+        warn "packages.sury.org/${component} has no build for '${codename}'; using distro packages."
+        return 0
+    fi
+
+    if [[ ! -s "$SURY_KEYRING" ]]; then
+        info "Installing the packages.sury.org signing key..."
+        run_with_retry curl -fsSLo /tmp/debsuryorg-archive-keyring.deb https://packages.sury.org/debsuryorg-archive-keyring.deb
+        dpkg -i /tmp/debsuryorg-archive-keyring.deb || fatal "Could not install the packages.sury.org signing key."
+        rm -f /tmp/debsuryorg-archive-keyring.deb
+    fi
+
+    info "Adding packages.sury.org/${component} for '${codename}'"
+    echo "deb [signed-by=${SURY_KEYRING}] https://packages.sury.org/${component}/ ${codename} main" \
+        >"/etc/apt/sources.list.d/sury-${component}.list"
+    SKIP_UPDATE=false
 }
 
 # Fix any broken/half-configured packages before we start installing
@@ -306,8 +222,8 @@ fix_broken_packages() {
 
 fix_broken_packages
 ensure_base_tools
-setup_ppa
-disable_unsupported_ondrej_ppas
+use_sury_repo php
+use_sury_repo apache2
 
 if [[ "$SKIP_UPDATE" == "false" ]]; then
     info "Updating package lists..."
@@ -341,7 +257,7 @@ install_php_packages() {
         codename=$(lsb_release -cs)
         local distro_versions
         distro_versions=$(apt-cache search --names-only '^php[0-9]+\.[0-9]+$' 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
-        fatal "PHP ${version} is not available in apt on this host. Ondrej PPA has no build for Ubuntu '${codename}' and the distro archive doesn't ship php${version}. Available distro PHP packages: ${distro_versions:-none}. Wait for Ondrej to publish, or pick a version Ubuntu provides."
+        fatal "PHP ${version} is not available in apt on this host. packages.sury.org has no build for Ubuntu '${codename}' and the distro archive doesn't ship php${version}. Available distro PHP packages: ${distro_versions:-none}. Pick a version Ubuntu provides."
     fi
 
     if is_apache_installed; then
