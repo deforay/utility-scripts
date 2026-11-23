@@ -15,7 +15,7 @@
 #   • Logical backups via mysqldump (portable, cross-version compatible)
 #   • Incremental backups with automatic base detection
 #   • Point-in-Time Recovery (PITR) via binary log replay
-#   • AES-256-GCM encryption for backup files
+#   • AES-256-CBC encryption for backup files
 #   • Compression (pigz, zstd, xz, gzip)
 #   • SHA256 checksums for integrity verification
 #   • Email and webhook notifications
@@ -292,7 +292,7 @@
 #   SECURITY NOTES
 #   --------------
 #   • Credentials are stored securely via mysql_config_editor (encrypted)
-#   • Backup encryption uses AES-256-GCM (authenticated encryption)
+#   • Backup encryption uses AES-256-CBC with PBKDF2 key derivation
 #   • Key files must have 600 permissions and be owned by root
 #   • Config files are validated for safe ownership before loading
 #   • Database/table names are validated to prevent SQL injection
@@ -770,11 +770,17 @@ declare -g OPERATION_IN_PROGRESS=""
 declare -g MYSQL_WAS_STOPPED=0
 declare -g DATADIR_BACKUP_PATH=""
 declare -g EXPECTED_ERROR_EXIT=0  # Set to 1 when returning error intentionally (e.g., partial backup success)
+declare -g CLEANUP_DONE=0         # Guard so cleanup runs once (a signal handler exits, re-triggering EXIT)
 
 # Critical cleanup on exit/interrupt
 emergency_cleanup() {
     local exit_code=$?
     local signal="${1:-EXIT}"
+
+    # Run cleanup once. A signal handler calls this then exits, which fires the
+    # EXIT trap and would otherwise run the whole routine a second time.
+    [[ "$CLEANUP_DONE" == "1" ]] && return 0
+    CLEANUP_DONE=1
 
     # Only log error if this is an actual unexpected error (not normal exit or expected error)
     if [[ $exit_code -ne 0 ]] && [[ "$EXPECTED_ERROR_EXIT" != "1" ]]; then
@@ -826,10 +832,12 @@ emergency_cleanup() {
 }
 
 # Set up signal handlers
-trap 'emergency_cleanup SIGINT' SIGINT   # Ctrl+C
-trap 'emergency_cleanup SIGTERM' SIGTERM # kill
-trap 'emergency_cleanup SIGHUP' SIGHUP   # Terminal closed
-trap 'emergency_cleanup EXIT' EXIT       # Normal/abnormal exit
+# Signal handlers must exit so an interrupted operation actually stops rather
+# than resuming after cleanup. The EXIT trap then no-ops via CLEANUP_DONE.
+trap 'emergency_cleanup SIGINT; exit 130' SIGINT   # Ctrl+C
+trap 'emergency_cleanup SIGTERM; exit 143' SIGTERM # kill
+trap 'emergency_cleanup SIGHUP; exit 129' SIGHUP   # Terminal closed
+trap 'emergency_cleanup EXIT' EXIT                 # Normal/abnormal exit
 
 # ========================== Lock Management ==========================
 
@@ -1258,7 +1266,10 @@ compressor() {
 
 decompressor() {
     local file="$1"
-    
+    # Strip a trailing .enc so the real compression extension is detected
+    # (encrypted backups are named e.g. db.sql.zst.enc).
+    file="${file%.enc}"
+
     if [[ "$file" =~ \.zst$ ]]; then
         echo "zstd -d -c"
     elif [[ "$file" =~ \.xz$ ]]; then
@@ -1288,8 +1299,8 @@ get_binlog_extension() {
 
 encrypt_if_enabled() {
     if [[ "$ENCRYPT_BACKUPS" == "1" ]] && [[ -n "$ENCRYPTION_KEY_FILE" ]] && [[ -f "$ENCRYPTION_KEY_FILE" ]]; then
-        # Use AES-256-GCM for authenticated encryption (AEAD)
-        openssl enc -aes-256-gcm -salt -pbkdf2 -pass file:"$ENCRYPTION_KEY_FILE"
+        # AES-256-CBC: the openssl enc CLI does not support GCM/AEAD modes
+        openssl enc -aes-256-cbc -salt -pbkdf2 -pass file:"$ENCRYPTION_KEY_FILE"
     else
         cat
     fi
@@ -1298,8 +1309,8 @@ encrypt_if_enabled() {
 decrypt_if_encrypted() {
     local file="$1"
     if [[ "$file" =~ \.enc$ ]] && [[ -n "$ENCRYPTION_KEY_FILE" ]] && [[ -f "$ENCRYPTION_KEY_FILE" ]]; then
-        # Use AES-256-GCM for authenticated decryption
-        openssl enc -d -aes-256-gcm -pbkdf2 -pass file:"$ENCRYPTION_KEY_FILE"
+        # AES-256-CBC: the openssl enc CLI does not support GCM/AEAD modes
+        openssl enc -d -aes-256-cbc -pbkdf2 -pass file:"$ENCRYPTION_KEY_FILE"
     else
         cat
     fi
@@ -1636,7 +1647,7 @@ cleanup_partial_files() {
         if (( age > 3600 )); then
             log INFO "Removing orphaned partial file: $(basename "$f")"
             rm -f "$f"
-            ((count++)) || true
+            count=$((count + 1)) || true
         fi
     done < <(find "$BACKUP_DIR" -maxdepth 1 -name "*.partial" -type f 2>/dev/null)
 
@@ -1653,7 +1664,7 @@ cleanup_partial_files() {
         if (( age > 3600 )); then
             log INFO "Removing orphaned temp directory: $(basename "$d")"
             rm -rf "$d"
-            ((count++)) || true
+            count=$((count + 1)) || true
         fi
     done < <(find "$BACKUP_DIR" -maxdepth 1 -type d \( -name ".xtra_*" -o -name ".job_status.*" \) 2>/dev/null)
 
@@ -1729,7 +1740,7 @@ count_backups_per_db() {
     for f in "$BACKUP_DIR"/"$db"-*.sql.*; do
         [[ -f "$f" ]] || continue
         [[ "$f" =~ \.(sha256|meta)$ ]] && continue
-        ((count++)) || true
+        count=$((count + 1)) || true
     done
     echo "$count"
 }
@@ -1798,7 +1809,7 @@ smart_cleanup_for_space() {
         fi
 
         freed_mb=$((freed_mb + size_mb))
-        ((removed_count++))
+        removed_count=$((removed_count + 1))
     done
 
     log INFO "Smart cleanup complete: freed ${freed_mb}MB by removing $removed_count file(s)"
@@ -1922,7 +1933,7 @@ show_space_summary() {
     for f in "$BACKUP_DIR"/*.sql.* "$BACKUP_DIR"/*.tar "$BACKUP_DIR"/*.tar.*; do
         [[ -f "$f" ]] || continue
         [[ "$f" =~ \.(sha256|meta)$ ]] && continue
-        ((backup_count++))
+        backup_count=$((backup_count + 1))
     done
     echo "  Total backup files:   $backup_count"
     echo "  Minimum keep per DB:  $CLEAN_KEEP_MIN"
@@ -2616,13 +2627,23 @@ backup_full() {
 --events
 --hex-blob
 --default-character-set=utf8mb4
---set-gtid-purged=OFF
 --no-tablespaces
 --skip-lock-tables
 --master-data=0
---column-statistics=0
 OPTS
-    
+
+    # --column-statistics and --set-gtid-purged exist only on the MySQL 8
+    # client. MariaDB and MySQL 5.7 mysqldump abort on an unknown option, so
+    # add each one only when this mysqldump advertises it.
+    local _dumphelp
+    _dumphelp="$("$MYSQLDUMP" --help 2>/dev/null || true)"
+    if printf '%s\n' "$_dumphelp" | grep -q -- '--column-statistics'; then
+        DUMPOPTS="$DUMPOPTS --column-statistics=0"
+    fi
+    if printf '%s\n' "$_dumphelp" | grep -q -- '--set-gtid-purged'; then
+        DUMPOPTS="$DUMPOPTS --set-gtid-purged=OFF"
+    fi
+
     # Dump function with validation
     dump_one() {
         local db="$1"
@@ -2677,9 +2698,9 @@ OPTS
     # Always run sequentially to avoid job-control issues and reduce system impact.
     for db in "${DBS[@]}"; do
         if dump_one "$db"; then
-            ((completed++)) || true
+            completed=$((completed + 1)) || true
         else
-            ((errors++)) || true
+            errors=$((errors + 1)) || true
         fi
         show_progress "$completed" "${#DBS[@]}" "Backup"
     done
@@ -2820,7 +2841,7 @@ verify() {
     start_spinner "Verifying backups"
 
     for f in "${files[@]}"; do
-        ((idx++))
+        idx=$((idx + 1))
         show_progress "$idx" "${#files[@]}" "Verify"
         
         local base="$(basename "$f")"
@@ -2828,22 +2849,22 @@ verify() {
         
         # Check checksum if present
         if ! verify_checksum "$f"; then
-            ((warn_count++))
+            warn_count=$((warn_count + 1))
         fi
         
         # Tar bundles (xtrabackup): try listing
         if [[ "$f" =~ \.tar(\.enc)?$ ]]; then
             if [[ "$f" =~ \.enc$ ]]; then
                 if decrypt_if_encrypted "$f" < "$f" | tar -tf - >/dev/null 2>&1; then
-                    ((ok++)); debug "OK(tar,enc): $base"
+                    ok=$((ok + 1)); debug "OK(tar,enc): $base"
                 else
-                    ((bad++)); warn "CORRUPT (tar,enc): $base"; continue
+                    bad=$((bad + 1)); warn "CORRUPT (tar,enc): $base"; continue
                 fi
             else
                 if tar -tf "$f" >/dev/null 2>&1; then
-                    ((ok++)); debug "OK(tar): $base"
+                    ok=$((ok + 1)); debug "OK(tar): $base"
                 else
-                    ((bad++)); warn "CORRUPT (tar): $base"; continue
+                    bad=$((bad + 1)); warn "CORRUPT (tar): $base"; continue
                 fi
             fi
             continue
@@ -2853,15 +2874,15 @@ verify() {
         local decomp_cmd="$(decompressor "$f")"
         if [[ "$f" =~ \.enc$ ]]; then
             if decrypt_if_encrypted "$f" < "$f" | $decomp_cmd > /dev/null 2>&1; then
-                ((ok++)); debug "OK(enc): $base"
+                ok=$((ok + 1)); debug "OK(enc): $base"
             else
-                ((bad++)); warn "CORRUPT (enc): $base"; continue
+                bad=$((bad + 1)); warn "CORRUPT (enc): $base"; continue
             fi
         else
             if $decomp_cmd < "$f" > /dev/null 2>&1; then
-                ((ok++)); debug "OK: $base"
+                ok=$((ok + 1)); debug "OK: $base"
             else
-                ((bad++)); warn "CORRUPT: $base"; continue
+                bad=$((bad + 1)); warn "CORRUPT: $base"; continue
             fi
         fi
         
@@ -2877,14 +2898,14 @@ verify() {
                     hdr_ok=1
                 fi
             fi
-            (( hdr_ok == 1 )) || { ((warn_count++)); debug "Header check failed: $base"; }
+            (( hdr_ok == 1 )) || { warn_count=$((warn_count + 1)); debug "Header check failed: $base"; }
         fi
         
         # Metadata presence
         local ts="$(dump_ts_from_name "$base")"
         if [[ -n "$ts" ]]; then
             local meta="$BACKUP_DIR/backup-$ts.meta"
-            [[ -f "$meta" ]] || { ((warn_count++)); debug "Missing metadata: $base"; }
+            [[ -f "$meta" ]] || { warn_count=$((warn_count + 1)); debug "Missing metadata: $base"; }
         fi
     done
     
@@ -3088,11 +3109,23 @@ restore_database() {
     local files=()
     
     if [[ "$target" == "ALL" ]]; then
-        files=("$BACKUP_DIR"/*-*.sql.*)
+        # Restore only the newest dump per database. The *-*.sql.* pattern also
+        # matches checksum/metadata/partial sidecars and stale .err files, none
+        # of which are valid SQL streams, so filter them out before restoring.
+        local -A seen_db=()
+        local af abase adb
+        while IFS= read -r af; do
+            [[ -n "$af" ]] || continue
+            abase="$(basename "$af")"
+            adb="${abase%%-*}"
+            [[ -n "${seen_db[$adb]:-}" ]] && continue
+            seen_db["$adb"]=1
+            files+=("$af")
+        done < <(ls -1t "$BACKUP_DIR"/*-*.sql.* 2>/dev/null | grep -Ev '\.(sha256|err|partial|meta)$' || true)
         [[ ${#files[@]} -gt 0 ]] || err "No backups found"
-        log INFO "Restoring ALL databases"
+        log INFO "Restoring ALL databases (newest dump per database)"
     else
-        files=($(ls -1t "$BACKUP_DIR"/"$target"-*.sql.* 2>/dev/null | grep -v '\.sha256$' || true))
+        files=($(ls -1t "$BACKUP_DIR"/"$target"-*.sql.* 2>/dev/null | grep -Ev '\.(sha256|err|partial|meta)$' || true))
         [[ ${#files[@]} -gt 0 ]] || err "No backups found for: $target"
         files=("${files[0]}")
         log INFO "Restoring: $target from $(basename "${files[0]}")"
@@ -3298,7 +3331,7 @@ health() {
         echo "✅ MySQL Connection: OK"
     else
         echo "❌ MySQL Connection: FAILED"
-        ((status++))
+        status=$((status + 1))
     fi
     
     # Backup directory
@@ -3306,7 +3339,7 @@ health() {
         echo "✅ Backup Directory: OK ($BACKUP_DIR)"
     else
         echo "❌ Backup Directory: Not writable"
-        ((status++))
+        status=$((status + 1))
     fi
     
     # Disk space - comprehensive check
@@ -3324,13 +3357,13 @@ health() {
 
     if (( usage_percent >= ${SPACE_CRITICAL_PERCENT:-90} )); then
         echo "❌ Disk Space: ${available_gb}GB free, ${usage_percent}% used (CRITICAL!)"
-        ((status++))
+        status=$((status + 1))
     elif (( usage_percent >= ${SPACE_WARNING_PERCENT:-70} )); then
         echo "⚠️  Disk Space: ${available_gb}GB free, ${usage_percent}% used (warning)"
-        ((status++))
+        status=$((status + 1))
     elif (( available_gb < ${SPACE_MIN_FREE_GB:-5} )); then
         echo "⚠️  Disk Space: ${available_gb}GB free (below ${SPACE_MIN_FREE_GB:-5}GB minimum)"
-        ((status++))
+        status=$((status + 1))
     else
         echo "✅ Disk Space: ${available_gb}GB free, ${usage_percent}% used"
     fi
@@ -3340,7 +3373,7 @@ health() {
     if [[ "${SPACE_MAX_USAGE_GB:-0}" -gt 0 ]] 2>/dev/null; then
         if (( total_backup_gb >= SPACE_MAX_USAGE_GB )); then
             echo "⚠️  Backup Size Limit: ${total_backup_gb}GB / ${SPACE_MAX_USAGE_GB}GB (exceeded!)"
-            ((status++))
+            status=$((status + 1))
         else
             echo "ℹ️  Backup Size Limit: ${total_backup_gb}GB / ${SPACE_MAX_USAGE_GB}GB"
         fi
@@ -3348,7 +3381,7 @@ health() {
     
     # Last backup
     local last_backup
-    last_backup=$(find "$BACKUP_DIR" -name "*.sql.*" -o -name "*.tar.*" -type f ! -name "*.sha256" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2- || true)
+    last_backup=$(find "$BACKUP_DIR" \( -name "*.sql.*" -o -name "*.tar.*" \) -type f ! -name "*.sha256" ! -name "*.err" ! -name "*.partial" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2- || true)
     if [[ -n "$last_backup" ]]; then
         # BSD-safe stat
         local last_mtime
@@ -3364,11 +3397,11 @@ health() {
             echo "✅ Last Backup: ${age}h ago ($(basename "$last_backup"))"
         else
             echo "⚠️  Last Backup: ${age}h ago (outdated!)"
-            ((status++))
+            status=$((status + 1))
         fi
     else
         echo "⚠️  Last Backup: No backups found"
-        ((status++))
+        status=$((status + 1))
     fi
     
     # Binary logging
@@ -3406,7 +3439,7 @@ health() {
     # Encryption
     if [[ "$ENCRYPT_BACKUPS" == "1" ]] && [[ -f "$ENCRYPTION_KEY_FILE" ]]; then
         echo "✅ Encryption: Enabled"
-        check_key_perms || ((status++))
+        check_key_perms || status=$((status + 1))
     else
         echo "ℹ️  Encryption: Disabled"
     fi
@@ -3465,7 +3498,7 @@ tune() {
             install_mode=1
         fi
 
-        if curl -fsSL http://mysqltuner.pl/ -o "$tuner_path"; then
+        if curl -fsSL https://raw.githubusercontent.com/major/MySQLTuner-perl/master/mysqltuner.pl -o "$tuner_path"; then
             if (( install_mode )); then
                 chmod +x "$tuner_path"
                 log INFO "✅ Installed mysqltuner to $tuner_path"
@@ -3557,7 +3590,7 @@ maintain() {
     log INFO "Analyzing ${#tables[@]} table(s)..."
     local idx=0
     for t in "${tables[@]}"; do
-        ((idx++))
+        idx=$((idx + 1))
         # Validate table name to prevent SQL injection (even though from information_schema)
         if ! validate_identifier "$t" "table"; then
             warn "Skipping invalid table name: $t"
@@ -3581,7 +3614,7 @@ maintain() {
             log INFO "Starting OPTIMIZE (free space: ${free_mb}MB)"
             idx=0
             for t in "${tables[@]}"; do
-                ((idx++))
+                idx=$((idx + 1))
                 # Validate table name (already validated in ANALYZE loop, but be defensive)
                 if ! validate_identifier "$t" "table"; then
                     warn "Skipping invalid table name: $t"
@@ -3676,7 +3709,7 @@ cleanup() {
     keep_count=0
     for f in "${files[@]}"; do
       if (( keep_count < CLEAN_KEEP_MIN )); then
-        ((keep_count++))
+        keep_count=$((keep_count + 1))
         debug "Keeping (min): $(basename "$f")"
         continue
       fi
@@ -3684,11 +3717,11 @@ cleanup() {
       if [[ -n "$(find "$f" -mtime +"$days" -print -quit 2>/dev/null)" ]]; then
         if (( DRY_RUN == 1 )); then
           log INFO "DRY-RUN: Would delete $(basename "$f")"
-          ((deleted_count++))
+          deleted_count=$((deleted_count + 1))
         else
           log INFO "Deleting: $(basename "$f")"
           rm -f "$f" "${f}.sha256" 2>/dev/null || true
-          ((deleted_count++))
+          deleted_count=$((deleted_count + 1))
         fi
       fi
     done
@@ -3699,11 +3732,11 @@ cleanup() {
     [[ -f "$f" ]] || continue
     if (( DRY_RUN == 1 )); then
       log INFO "DRY-RUN: Would delete $(basename "$f")"
-      ((deleted_count++))
+      deleted_count=$((deleted_count + 1))
     else
       log INFO "Deleting: $(basename "$f")"
       rm -f "$f" "${f}.sha256" 2>/dev/null || true
-      ((deleted_count++))
+      deleted_count=$((deleted_count + 1))
     fi
   done < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name "incremental-*.binlog.*" -mtime +"$days" -print 2>/dev/null)
 
@@ -3715,11 +3748,11 @@ cleanup() {
     if ! compgen -G "$BACKUP_DIR/*-$ts.sql.*" >/dev/null 2>&1; then
       if (( DRY_RUN == 1 )); then
         log INFO "DRY-RUN: Would delete orphan meta $(basename "$m")"
-        ((deleted_count++))
+        deleted_count=$((deleted_count + 1))
       else
         log INFO "Deleting orphan meta: $(basename "$m")"
         rm -f "$m"
-        ((deleted_count++))
+        deleted_count=$((deleted_count + 1))
       fi
     fi
   done
@@ -3729,11 +3762,11 @@ cleanup() {
   while IFS= read -r idxf; do
     if (( DRY_RUN == 1 )); then
       log INFO "DRY-RUN: Would delete $(basename "$idxf")"
-      ((deleted_count++))
+      deleted_count=$((deleted_count + 1))
     else
       log INFO "Deleting: $(basename "$idxf")"
       rm -f "$idxf"
-      ((deleted_count++))
+      deleted_count=$((deleted_count + 1))
     fi
   done < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name "binlog-index-*.txt" -mtime +"$days" -print 2>/dev/null)
 
@@ -4017,7 +4050,7 @@ case "$cmd" in
         tune "$@"
         ;;
     maintain)
-        maintain "${1:-quick}"
+        maintain "$@"
         ;;
     cleanup)
         cleanup "${1:-$RETENTION_DAYS}"
