@@ -162,7 +162,7 @@ check_dependencies() {
 # teamviewer.list, which makes apt refuse to run at all) no longer stops setup:
 # that file is moved to /root/apt-sources-disabled and the update retried.
 # Only files apt itself names as unparseable are moved, and never the distro's
-# own sources or a Launchpad PPA (setup needs ondrej). Every other apt error
+# own sources or a PHP/Apache source (packages.sury.org, or a Launchpad PPA). Every other apt error
 # (missing Release file, conflicting options, unsigned repo) is reported with
 # the files to look at, because guessing which entry is broken could disable a
 # healthy or required source.
@@ -181,7 +181,7 @@ apt_update_or_heal() {
         local -a movable=()
         for file in "${bad[@]}"; do
             [[ -f "$file" ]] || continue
-            if [[ "$file" =~ /(ubuntu|debian)\.sources$ ]] || grep -qE 'launchpad(content)?\.net|ppa\.launchpad' "$file"; then
+            if [[ "$file" =~ /(ubuntu|debian)\.sources$ ]] || grep -qE 'launchpad(content)?\.net|ppa\.launchpad|packages\.sury\.org' "$file"; then
                 continue
             fi
             movable+=("$file")
@@ -253,57 +253,54 @@ setup_system() {
         print info "All basic packages are already installed"
     fi
 
-    # Add ondrej/apache2 only if Launchpad publishes the current codename.
-    # Cross-codename installs break due to ABI mismatches (libxml2 t64 etc.),
-    # so on unsupported Ubuntu releases we stick with the distro apache2.
-    local apache_ppa="ondrej/apache2"
-    local codename
+    # Apache comes from packages.sury.org, which replaced the frozen ondrej/apache2 PPA.
+    use_sury_repo apache2
+    apt-get update || true
+}
+
+# Ondrej's Launchpad PPAs are frozen. PHP and Apache are now published at
+# packages.sury.org (https://packages.sury.org/php/README.txt).
+SURY_KEYRING=/usr/share/keyrings/debsuryorg-archive-keyring.gpg
+
+# Use packages.sury.org/<component> for this Ubuntu release, and retire the frozen
+# ondrej/<component> PPA as its notice says. Installed packages stay and get their next
+# updates from sury. When sury answers 404 for this release, the distro packages are used.
+# A timeout or a 5xx still adds the repository: only a 404 means "no build".
+use_sury_repo() {
+    local component="$1" codename code f
     codename=$(lsb_release -cs)
-    local apache_list="/etc/apt/sources.list.d/ondrej-ubuntu-apache2-${codename}.list"
-    local apache_sources="/etc/apt/sources.list.d/ondrej-ubuntu-apache2-${codename}.sources"
 
-    if [[ -f "${apache_list}.disabled" || -f "${apache_sources}.disabled" ]]; then
-        print info "${apache_ppa} previously disabled on '${codename}'; using distro apache2."
-    elif grep -q "ondrej/apache2" /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null; then
-        print info "${apache_ppa} PPA already added"
-        disable_apache2_ppa_if_unsupported "$codename" "$apache_list" "$apache_sources"
-    elif ! ppa_has_codename "$apache_ppa" "$codename"; then
-        print warning "${apache_ppa} has no build for '${codename}'; skipping PPA, using distro apache2."
-    else
-        print info "Adding ${apache_ppa} PPA..."
-        add-apt-repository ppa:ondrej/apache2 -y
-        apt-get update
-    fi
-}
+    for f in /etc/apt/sources.list.d/ondrej-ubuntu-"${component}"-*; do
+        [[ -e "$f" ]] || continue
+        rm -f "$f"
+        print info "Removed frozen PPA source $(basename "$f")"
+    done
 
-# False only when Launchpad answers that it does not publish <codename> (404).
-# A timeout or a dropped connection used to count as "no build" and disabled
-# the PPA for good on a slow link. Without an answer, the PPA stays.
-ppa_has_codename() {
-    local ppa_path="$1" cn="$2" code
-    code=$(curl -sSLI -o /dev/null --max-time 20 --retry 2 --retry-delay 2 -w '%{http_code}' \
-        "https://ppa.launchpadcontent.net/${ppa_path}/ubuntu/dists/${cn}/Release" 2>/dev/null) || true
-    [[ "${code:-000}" != "404" ]]
-}
-
-# If ondrej/apache2 doesn't publish $codename, disable its source files so apt
-# falls back to the distro archive. Heals a previous noble-pin by restoring
-# the codename inside the file to match its filename suffix before disabling.
-disable_apache2_ppa_if_unsupported() {
-    local codename="$1" apache_list="$2" apache_sources="$3"
-
-    if ppa_has_codename "ondrej/apache2" "$codename"; then
-        [[ -f "$apache_sources" ]] && sed -i -E "s/^(Suites:[[:space:]]*).*/\1${codename}/" "$apache_sources" 2>/dev/null || true
-        [[ -f "$apache_list" ]]    && sed -i -E "s|(ubuntu[[:space:]]+)[a-zA-Z]+([[:space:]]+main)|\1${codename}\2|" "$apache_list" 2>/dev/null || true
+    if grep -rqs "packages\.sury\.org/${component}" /etc/apt/sources.list /etc/apt/sources.list.d/; then
+        print info "packages.sury.org/${component} already configured."
         return 0
     fi
 
-    print warning "ondrej/apache2 has no build for '${codename}'; disabling PPA, falling back to distro apache2."
-    [[ -f "$apache_sources" ]] && sed -i -E "s/^(Suites:[[:space:]]*).*/\1${codename}/" "$apache_sources" 2>/dev/null || true
-    [[ -f "$apache_list" ]]    && sed -i -E "s|(ubuntu[[:space:]]+)[a-zA-Z]+([[:space:]]+main)|\1${codename}\2|" "$apache_list" 2>/dev/null || true
-    [[ -f "$apache_sources" ]] && mv "$apache_sources" "${apache_sources}.disabled"
-    [[ -f "$apache_list" ]]    && mv "$apache_list" "${apache_list}.disabled"
-    apt-get update || true
+    code=$(curl -sSLI -o /dev/null --max-time 20 --retry 3 --retry-delay 2 -w '%{http_code}' \
+        "https://packages.sury.org/${component}/dists/${codename}/Release" 2>/dev/null) || true
+    if [[ "$code" == "404" ]]; then
+        print warning "packages.sury.org/${component} has no build for '${codename}'; using distro packages."
+        return 0
+    fi
+
+    if [[ ! -s "$SURY_KEYRING" ]]; then
+        print info "Installing the packages.sury.org signing key..."
+        curl -fsSLo /tmp/debsuryorg-archive-keyring.deb https://packages.sury.org/debsuryorg-archive-keyring.deb &&
+            dpkg -i /tmp/debsuryorg-archive-keyring.deb || {
+            print error "Could not install the packages.sury.org signing key."
+            return 1
+        }
+        rm -f /tmp/debsuryorg-archive-keyring.deb
+    fi
+
+    print info "Adding packages.sury.org/${component} for '${codename}'"
+    echo "deb [signed-by=${SURY_KEYRING}] https://packages.sury.org/${component}/ ${codename} main" \
+        >"/etc/apt/sources.list.d/sury-${component}.list"
 }
 
 setup_locale() {
