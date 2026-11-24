@@ -124,7 +124,7 @@ is_valid_ubuntu() {
 }
 
 # Pick the default PHP major.minor for the running OS when the caller didn't
-# pass a version. Ubuntu <=24.04 carries (and ondrej's PPA still builds) PHP
+# pass a version. Ubuntu <=24.04 carries (and packages.sury.org builds) PHP
 # 8.4; Ubuntu 26.04 dropped 8.4 and ships 8.5, so default to 8.5 there. Any
 # explicit version passed on the command line always wins over this.
 default_php_version_for_os() {
@@ -262,45 +262,128 @@ setup_system() {
 # packages.sury.org (https://packages.sury.org/php/README.txt).
 SURY_KEYRING=/usr/share/keyrings/debsuryorg-archive-keyring.gpg
 
+# True when apt reads an active packages.sury.org/<component> source for
+# <codename>: sury_source_active php|apache2 noble.
+#
+# Only what apt reads counts: sources.list, sources.list.d/*.list (uncommented
+# deb lines) and sources.list.d/*.sources (deb822 stanzas of Types deb, not
+# "Enabled: no", with fields that may continue onto following lines). A release
+# upgrade comments third-party sources out, leaves .save and .distUpgrade
+# copies behind, and keeps the old codename, so none of those count. Missing a
+# deb822 source would add a second one with a different Signed-By, which apt
+# rejects. The apt directory can be overridden with SURY_APT_DIR, for testing.
+# The same function is in vlsm's scripts/shared-functions.sh and in ePT's
+# bin/shared-functions.sh.
+sury_source_active() {
+    local component="$1" codename="$2" dir="${SURY_APT_DIR:-/etc/apt}" f
+    local url="packages\\.sury\\.org/${component}([/[:space:]]|$)"
+
+    for f in "$dir/sources.list" "$dir"/sources.list.d/*.list; do
+        [ -f "$f" ] || continue
+        grep -Eqs "^[[:space:]]*deb[[:space:]].*packages\\.sury\\.org/${component}/?[[:space:]]+${codename}([[:space:]]|$)" "$f" &&
+            return 0
+    done
+
+    for f in "$dir"/sources.list.d/*.sources; do
+        [ -f "$f" ] || continue
+        # apt ignores carriage returns, so a file saved with CRLF line endings
+        # still has blank lines between its stanzas. Strip them before awk splits.
+        tr -d '\r' <"$f" | awk -v url="$url" -v cn="$codename" '
+            BEGIN { RS = "" }
+            {
+                enabled = 1; found = 0; suite = 0; isdeb = 0; field = ""
+                n = split($0, lines, "\n")
+                for (i = 1; i <= n; i++) {
+                    line = lines[i]
+                    if (line ~ /^[[:space:]]*#/) continue
+                    value = line
+                    # A line starting with whitespace continues the field above it.
+                    if (line !~ /^[[:space:]]/) {
+                        field = tolower(line)
+                        sub(/:.*/, "", field)
+                        sub(/^[^:]*:/, "", value)
+                        if (tolower(line) ~ /^enabled:[[:space:]]*no[[:space:]]*$/) enabled = 0
+                    }
+                    if (field == "uris" && line ~ url) found = 1
+                    if (field == "suites" || field == "types") {
+                        m = split(value, words, /[[:space:]]+/)
+                        for (j = 1; j <= m; j++) {
+                            if (field == "suites" && words[j] == cn) suite = 1
+                            if (field == "types" && words[j] == "deb") isdeb = 1
+                        }
+                    }
+                }
+                if (enabled && found && suite && isdeb) { hit = 1; exit }
+            }
+            END { exit hit ? 0 : 1 }
+        ' && return 0
+    done
+
+    return 1
+}
+
+# Keep the frozen ondrej/<component> PPA as a fallback only while it has a build for
+# <codename>: a source with no build makes every apt-get update fail, and
+# ondrej/apache2 has none for 26.04. Only a 404 removes it; a timeout or an
+# unreachable Launchpad keeps it.
+drop_ppa_without_build() {
+    local component="$1" codename="$2" f code
+    local files=(/etc/apt/sources.list.d/ondrej-ubuntu-"${component}"-*)
+    [[ -e "${files[0]}" ]] || return 0
+    code=$(curl --proto =https -sSLI -o /dev/null --max-time 20 --retry 3 --retry-delay 2 -w '%{http_code}' \
+        "https://ppa.launchpadcontent.net/ondrej/${component}/ubuntu/dists/${codename}/Release" 2>/dev/null) || true
+    [[ "$code" == "404" ]] || return 0
+    for f in "${files[@]}"; do
+        [[ -e "$f" ]] || continue
+        rm -f "$f"
+        print info "Removed frozen PPA source $(basename "$f"): no build for '${codename}'"
+    done
+}
+
 # Use packages.sury.org/<component> for this Ubuntu release, and retire the frozen
 # ondrej/<component> PPA as its notice says. Installed packages stay and get their next
-# updates from sury. When sury answers 404 for this release, the distro packages are used.
-# A timeout or a 5xx still adds the repository: only a 404 means "no build".
+# updates from sury. A timeout or a 5xx still adds the repository: only a 404 means
+# "no build". The PPA is removed only once sury is in place: on a release sury does
+# not build (404), or when the signing key cannot be installed, the frozen PPA still
+# serves its last packages, and removing it would leave only the distro's packages.
 use_sury_repo() {
-    local component="$1" codename code f
+    local component="$1" codename code f keydeb
     codename=$(lsb_release -cs)
+
+    if sury_source_active "$component" "$codename"; then
+        print info "packages.sury.org/${component} already configured."
+    else
+        code=$(curl --proto =https -sSLI -o /dev/null --max-time 20 --retry 3 --retry-delay 2 -w '%{http_code}' \
+            "https://packages.sury.org/${component}/dists/${codename}/Release" 2>/dev/null) || true
+        if [[ "$code" == "404" ]]; then
+            print warning "packages.sury.org/${component} has no build for '${codename}'; using distro packages."
+            drop_ppa_without_build "$component" "$codename"
+            return 0
+        fi
+
+        if [[ ! -s "$SURY_KEYRING" ]]; then
+            print info "Installing the packages.sury.org signing key..."
+            keydeb=$(mktemp)
+            if ! curl --proto =https -fsSLo "$keydeb" https://packages.sury.org/debsuryorg-archive-keyring.deb ||
+                ! dpkg -i "$keydeb"; then
+                rm -f "$keydeb"
+                drop_ppa_without_build "$component" "$codename"
+                print error "Could not install the packages.sury.org signing key."
+                return 1
+            fi
+            rm -f "$keydeb"
+        fi
+
+        print info "Adding packages.sury.org/${component} for '${codename}'"
+        echo "deb [signed-by=${SURY_KEYRING}] https://packages.sury.org/${component}/ ${codename} main" \
+            >"/etc/apt/sources.list.d/sury-${component}.list"
+    fi
 
     for f in /etc/apt/sources.list.d/ondrej-ubuntu-"${component}"-*; do
         [[ -e "$f" ]] || continue
         rm -f "$f"
         print info "Removed frozen PPA source $(basename "$f")"
     done
-
-    if grep -rqs "packages\.sury\.org/${component}" /etc/apt/sources.list /etc/apt/sources.list.d/; then
-        print info "packages.sury.org/${component} already configured."
-        return 0
-    fi
-
-    code=$(curl -sSLI -o /dev/null --max-time 20 --retry 3 --retry-delay 2 -w '%{http_code}' \
-        "https://packages.sury.org/${component}/dists/${codename}/Release" 2>/dev/null) || true
-    if [[ "$code" == "404" ]]; then
-        print warning "packages.sury.org/${component} has no build for '${codename}'; using distro packages."
-        return 0
-    fi
-
-    if [[ ! -s "$SURY_KEYRING" ]]; then
-        print info "Installing the packages.sury.org signing key..."
-        curl -fsSLo /tmp/debsuryorg-archive-keyring.deb https://packages.sury.org/debsuryorg-archive-keyring.deb &&
-            dpkg -i /tmp/debsuryorg-archive-keyring.deb || {
-            print error "Could not install the packages.sury.org signing key."
-            return 1
-        }
-        rm -f /tmp/debsuryorg-archive-keyring.deb
-    fi
-
-    print info "Adding packages.sury.org/${component} for '${codename}'"
-    echo "deb [signed-by=${SURY_KEYRING}] https://packages.sury.org/${component}/ ${codename} main" \
-        >"/etc/apt/sources.list.d/sury-${component}.list"
 }
 
 setup_locale() {

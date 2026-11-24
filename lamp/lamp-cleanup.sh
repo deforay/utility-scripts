@@ -105,6 +105,12 @@ rm -f /etc/apt/sources.list.d/ondrej-ubuntu-apache2*.list.disabled
 rm -f /etc/apt/sources.list.d/ondrej-ubuntu-apache2*.sources
 rm -f /etc/apt/sources.list.d/ondrej-ubuntu-apache2*.sources.disabled
 
+# Remove the packages.sury.org sources that replaced the PPAs, and their signing key
+rm -f /etc/apt/sources.list.d/sury-php.list /etc/apt/sources.list.d/sury-apache2.list
+rm -rf /var/lib/apt/lists/packages.sury.org_*
+dpkg -r debsuryorg-archive-keyring 2>/dev/null || true
+rm -f /usr/share/keyrings/debsuryorg-archive-keyring.gpg
+
 # Update apt cache after removing PPAs
 apt-get update
 
